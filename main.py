@@ -131,7 +131,7 @@ async def convert_to_pdf(request: ConvertRequest):
             LIBREOFFICE, "--headless",
             "--norestore",
             "--nofirststartwizard",
-            f"--env:UserInstallation=file://{user_profile}",
+            f"-env:UserInstallation=file://{user_profile}",
             "--convert-to", "pdf",
             "--outdir", tmpdir,
             str(input_path)

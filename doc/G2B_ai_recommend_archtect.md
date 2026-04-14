@@ -1,6 +1,5 @@
 # 나라장터 AI 공고 추천 시스템 아키텍처
 
-> Claude Code 컨텍스트용 문서  
 > 최종 정리: 2026-04-14
 
 ---
@@ -456,8 +455,6 @@ company_recommendation (
 
 ### 2단계 - 조건부 Dify 저장
 아래 조건 해당 시만 Dify 지식DB에 저장:
-- 추정가격 1억원 이상
-- IT/SW 관련 품목코드
 - RFP 파일 존재하는 건
 
 Dify 저장 후 `DIFY_DOC_ID` 기록 → 2차 정밀 RAG 매칭에 활용

@@ -22,6 +22,8 @@ class Bid(Base):
     cntrct_cnclsn_mtd_nm = Column(String(100), nullable=True,  comment="계약방법")
     presmpt_prce         = Column(BigInteger,  nullable=True,  comment="추정가격(원)")
     bid_clsfctn_no       = Column(String(20),  nullable=True,  comment="입찰분류번호")
+    bid_kind             = Column(String(100), nullable=True,  comment="공고종류")
+    detail_url           = Column(Text,        nullable=True,  comment="공고 상세링크")
 
     # RFP 파일 처리
     has_rfp              = Column(Boolean,     default=False,  comment="RFP 포함 여부")
