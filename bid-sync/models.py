@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, Text, Boolean, BigInteger, JSON, Index
+from sqlalchemy import Column, String, DateTime, Text, Boolean, BigInteger, JSON, Index, Numeric
 from sqlalchemy.sql import func
 from database import Base
 
@@ -59,3 +59,20 @@ class Bid(Base):
         Index("idx_bids_ntce_instt",       "ntce_instt_nm"),
         Index("idx_bids_clsfctn_no",       "bid_clsfctn_no"),
     )
+
+
+class BidCompanyMapping(Base):
+    __tablename__ = "tb_bids_company_mapping"
+
+    company_id     = Column(BigInteger,    primary_key=True, comment="기업ID")
+    bid_ntce_no    = Column(String(40),    primary_key=True, comment="공고번호")
+    bid_ntce_ord   = Column(String(10),    primary_key=True, comment="공고차수")
+
+    match_type_cd  = Column(String(20),    default="AI",     comment="매칭유형 (AI/MANUAL)")
+    match_score    = Column(Numeric(5, 4), nullable=True,     comment="매칭점수 (0.0000~1.0000)")
+    match_reason   = Column(String(1000),  nullable=True,     comment="매칭사유")
+    match_keywords = Column(JSON,          nullable=True,     comment="매칭 키워드 배열")
+    bookmark_yn    = Column(String(1),     default="N",      comment="북마크 여부")
+    last_match_dt  = Column(DateTime,      nullable=True,     comment="마지막 매칭일시")
+    created_at     = Column(DateTime,      server_default=func.now())
+    updated_at     = Column(DateTime,      onupdate=func.now())
