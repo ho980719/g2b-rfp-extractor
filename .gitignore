@@ -1,0 +1,36 @@
+# 환경변수
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# 가상환경
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 임시 파일
+*.tmp
+*.log
+tmp/
+temp/
+
+# Docker
+*.tar
+
+# OS
+.DS_Store
+Thumbs.db
