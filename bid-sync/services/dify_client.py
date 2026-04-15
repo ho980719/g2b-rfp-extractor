@@ -33,39 +33,41 @@ async def upload_to_knowledge(pdf_path: Path, bid) -> str:
     """PDF를 Dify 지식DB에 업로드 후 document_id 반환"""
     headers = {"Authorization": f"Bearer {DIFY_API_KEY}"}
 
-    doc_metadata = [
-        {"id": FIELD_IDS["bid_no"],      "value": bid.bid_ntce_no or ""},
-        {"id": FIELD_IDS["bid_ord"],     "value": bid.bid_ntce_ord or ""},
-        {"id": FIELD_IDS["bid_kind"],    "value": bid.bid_kind or ""},
-        {"id": FIELD_IDS["bid_title"],   "value": bid.bid_ntce_nm or ""},
-        {"id": FIELD_IDS["org_name"],    "value": bid.ntce_instt_nm or ""},
-        {"id": FIELD_IDS["bid_date"],    "value": bid.bid_ntce_dt or ""},
-        {"id": FIELD_IDS["open_date"],   "value": bid.openg_dt or ""},
-        {"id": FIELD_IDS["budget"],      "value": str(bid.presmpt_prce or "")},
-        {"id": FIELD_IDS["award_type"],  "value": bid.bid_mtd_nm or ""},
-        {"id": FIELD_IDS["detail_url"],  "value": bid.detail_url or ""},
-        {"id": FIELD_IDS["bid_clse_dt"], "value": bid.bid_clse_dt or ""},
-        {"id": FIELD_IDS["bid_clsfctn_no"], "value": bid.bid_clsfctn_no or ""},
-    ]
-
     data = {
         "indexing_technique": "high_quality",
         "process_rule": {"mode": "automatic"},
-        "doc_metadata": doc_metadata,
     }
 
     async with httpx.AsyncClient(timeout=120.0) as client:
+        unique_name = f"{bid.bid_ntce_no}_{bid.bid_ntce_ord}.pdf"
         with open(pdf_path, "rb") as f:
             response = await client.post(
                 f"{DIFY_API_URL}/datasets/{DIFY_DATASET_ID}/document/create-by-file",
                 headers=headers,
-                files={"file": (pdf_path.name, f, "application/pdf")},
+                files={"file": (unique_name, f, "application/pdf")},
                 data={"data": json.dumps(data, ensure_ascii=False)},
             )
         response.raise_for_status()
 
     doc_id = response.json()["document"]["id"]
     logger.info(f"Dify 업로드 완료: {bid.bid_ntce_no} → doc_id={doc_id}")
+
+    # 업로드 후 전체 메타데이터 설정
+    await update_metadata(doc_id, {
+        "bid_no":        bid.bid_ntce_no or "",
+        "bid_ord":       bid.bid_ntce_ord or "",
+        "bid_kind":      bid.bid_kind or "",
+        "bid_title":     bid.bid_ntce_nm or "",
+        "org_name":      bid.ntce_instt_nm or "",
+        "bid_date":      bid.bid_ntce_dt or "",
+        "open_date":     bid.openg_dt or "",
+        "budget":        str(bid.presmpt_prce or ""),
+        "award_type":    bid.bid_mtd_nm or "",
+        "detail_url":    bid.detail_url or "",
+        "bid_clse_dt":   bid.bid_clse_dt or "",
+        "bid_clsfctn_no": bid.bid_clsfctn_no or "",
+    })
+
     return doc_id
 
 
