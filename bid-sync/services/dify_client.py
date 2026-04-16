@@ -141,10 +141,10 @@ async def update_metadata(doc_id: str, fields: dict) -> None:
     logger.info(f"Dify 메타데이터 업데이트 완료: doc_id={doc_id}")
 
 
-async def retrieve_rag_scores(query: str, doc_ids: list[str]) -> dict[str, float]:
+async def retrieve_rag_scores(query: str, doc_ids: list[str]) -> dict[str, dict]:
     """
-    Dify 지식DB에서 query로 시맨틱 검색 후 doc_ids 중 매칭된 문서의 점수 반환.
-    Returns: {doc_id: score (0.0~1.0)}
+    Dify 지식DB에서 query로 시맨틱 검색 후 doc_ids 중 매칭된 문서의 점수와 세그먼트 반환.
+    Returns: {doc_id: {"score": float, "segment": str}}  — 문서당 최고 점수 세그먼트
     """
     if not doc_ids or not query.strip():
         return {}
@@ -157,7 +157,7 @@ async def retrieve_rag_scores(query: str, doc_ids: list[str]) -> dict[str, float
         "query": query,
         "retrieval_model": {
             "search_method": "semantic_search",
-            "top_k": min(len(doc_ids) * 3, 100),
+            "top_k": min(len(doc_ids) * 5, 2000),
             "score_threshold_enabled": False,
             "score_threshold": 0.0,
             "reranking_enable": False,
@@ -177,12 +177,18 @@ async def retrieve_rag_scores(query: str, doc_ids: list[str]) -> dict[str, float
     records = response.json().get("records", [])
     doc_id_set = set(doc_ids)
 
-    scores = {}
+    results: dict[str, dict] = {}
     for record in records:
-        doc_id = record.get("segment", {}).get("document_id") or record.get("document", {}).get("id")
+        segment = record.get("segment", {})
+        doc_id = segment.get("document_id") or record.get("document", {}).get("id")
         score = float(record.get("score", 0.0))
         if doc_id in doc_id_set:
-            scores[doc_id] = max(scores.get(doc_id, 0.0), score)
+            if score > results.get(doc_id, {}).get("score", -1.0):
+                content = (segment.get("content") or "").strip()
+                results[doc_id] = {
+                    "score": score,
+                    "segment": content[:200] if content else "",
+                }
 
-    logger.info(f"RAG 검색 완료: {len(scores)}/{len(doc_ids)}건 매칭")
-    return scores
+    logger.info(f"RAG 검색 완료: {len(results)}/{len(doc_ids)}건 매칭")
+    return results

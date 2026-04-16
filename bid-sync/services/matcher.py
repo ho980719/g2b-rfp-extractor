@@ -26,8 +26,11 @@ def _get_item_codes(company_id: int, db: Session) -> list[str]:
     return [r[0] for r in rows]
 
 
-def _get_keywords(company_id: int, db: Session) -> set[str]:
-    """키워드명 + 동의어 모두 수집, 공백 제거 소문자 정규화"""
+def _get_keywords(company_id: int, db: Session) -> tuple[set[str], list[str]]:
+    """
+    (정규화된 키워드 set, 원본 키워드 list) 반환.
+    정규화: 매칭 비교용 / 원본: RAG 쿼리용
+    """
     rows = db.execute(text("""
         SELECT km.KEYWORD_NM
         FROM tb_company_keyword ck
@@ -42,7 +45,9 @@ def _get_keywords(company_id: int, db: Session) -> set[str]:
         WHERE ck.COMPANY_ID = :cid AND ck.USE_YN = 'Y' AND ka.USE_YN = 'Y'
     """), {"cid": company_id}).fetchall()
 
-    return {_normalize(r[0]) for r in rows + alias_rows if r[0]}
+    originals = [r[0] for r in rows if r[0]]
+    normalized = {_normalize(r[0]) for r in rows + alias_rows if r[0]}
+    return normalized, originals
 
 
 def _get_settings(company_id: int, db: Session) -> dict:
@@ -144,7 +149,7 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
     점수: W_ITEM(0.30) + W_KEYWORD(0.25) + W_RFP_RAG(0.35) = 최대 0.90
     """
     item_codes = _get_item_codes(company_id, db)
-    keywords = _get_keywords(company_id, db)
+    keywords, keywords_raw = _get_keywords(company_id, db)
     settings = _get_settings(company_id, db)
     profile_summary = _get_profile_summary(company_id, db)
 
@@ -166,16 +171,17 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
 
     logger.info(f"기업 {company_id}: 1차 필터 후 후보 {len(candidates)}건")
 
-    # 2단계: 후보 대상 Dify RAG 점수 조회 (dify_doc_id 있는 것만)
-    rag_query = " ".join(list(keywords)[:10])
+    # 2단계: 후보 대상 Dify RAG 점수 조회
+    # 원본 키워드(공백 유지)로 쿼리 — 정규화된 키워드는 임베딩 품질 저하
+    rag_query = " ".join(keywords_raw[:10])
     if profile_summary:
-        rag_query = f"{profile_summary[:200]} {rag_query}"
+        rag_query = f"{profile_summary[:300]} {rag_query}"
 
     doc_ids = [bid.dify_doc_id for bid, *_ in candidates if bid.dify_doc_id]
-    rag_scores: dict[str, float] = {}
+    rag_results: dict[str, dict] = {}
     if doc_ids:
         try:
-            rag_scores = await retrieve_rag_scores(rag_query, doc_ids)
+            rag_results = await retrieve_rag_scores(rag_query, doc_ids)
         except Exception as e:
             logger.warning(f"RAG 점수 조회 실패 (무시): {e}")
 
@@ -185,7 +191,10 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
 
     for bid, item_matched, matched_kws, kw_score in candidates:
         item_score = W_ITEM if item_matched else 0.0
-        rag_score = rag_scores.get(bid.dify_doc_id, 0.0) if bid.dify_doc_id else 0.0
+        rag_hit = rag_results.get(bid.dify_doc_id) if bid.dify_doc_id else None
+        raw_rag = rag_hit["score"] if rag_hit else 0.0
+        # Dify 한국어 유사도는 0.2~0.6 범위 > 0~1로 리스케일 (0.2 이하=0, 0.6 이상=1)
+        rag_score = max(0.0, min(1.0, (raw_rag - 0.2) / 0.4))
         score = round(item_score + kw_score * W_KEYWORD + rag_score * W_RFP_RAG, 4)
 
         reasons = []
@@ -197,6 +206,11 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
             reasons.append(f"RAG({rag_score:.2f})")
         reason = " + ".join(reasons)
 
+        # match_keywords: {"keywords": [...], "rag": {"score": float, "segment": str}}
+        kw_json: dict = {"keywords": matched_kws}
+        if rag_hit and rag_hit["score"] > 0:
+            kw_json["rag"] = {"score": round(raw_rag, 4), "segment": rag_hit["segment"]}
+
         existing = db.query(BidCompanyMapping).filter_by(
             company_id=company_id,
             bid_ntce_no=bid.bid_ntce_no,
@@ -206,7 +220,7 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
         if existing:
             existing.match_score = score
             existing.match_reason = reason[:1000]
-            existing.match_keywords = matched_kws
+            existing.match_keywords = kw_json
             existing.last_match_dt = now
         else:
             db.add(BidCompanyMapping(
@@ -216,7 +230,7 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
                 match_type_cd="AI",
                 match_score=score,
                 match_reason=reason[:1000],
-                match_keywords=matched_kws,
+                match_keywords=kw_json,
                 last_match_dt=now,
             ))
 
