@@ -23,6 +23,9 @@ class Bid(Base):
     presmpt_prce         = Column(BigInteger,  nullable=True,  comment="추정가격(원)")
     bid_clsfctn_no       = Column(String(20),  nullable=True,  comment="입찰분류번호")
     bid_kind             = Column(String(100), nullable=True,  comment="공고종류")
+    srvce_div_nm         = Column(String(100), nullable=True,  comment="서비스구분명 (기술용역 등)")
+    is_mock_yn           = Column(String(1),   default="N",    comment="모의공고여부 (공고번호 T로 시작 시 Y)")
+    is_urgent_yn         = Column(String(1),   default="N",    comment="긴급공고여부 (ntceKindNm 긴급 포함 시 Y)")
     detail_url           = Column(Text,        nullable=True,  comment="공고 상세링크")
 
     # RFP 파일 처리
@@ -72,6 +75,7 @@ class BidCompanyMapping(Base):
     match_score    = Column(Numeric(5, 4), nullable=True,     comment="매칭점수 (0.0000~1.0000)")
     match_reason   = Column(String(1000),  nullable=True,     comment="매칭사유")
     match_keywords = Column(JSON,          nullable=True,     comment="매칭 키워드 배열")
+    reason_status  = Column(String(20),    default="PENDING", comment="추천이유 생성상태 PENDING/DONE/FAILED")
     bookmark_yn    = Column(String(1),     default="N",      comment="북마크 여부")
     last_match_dt  = Column(DateTime,      nullable=True,     comment="마지막 매칭일시")
     created_at     = Column(DateTime,      server_default=func.now())

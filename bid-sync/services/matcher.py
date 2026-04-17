@@ -221,6 +221,7 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
             existing.match_score = score
             existing.match_reason = reason[:1000]
             existing.match_keywords = kw_json
+            existing.reason_status = "PENDING"
             existing.last_match_dt = now
         else:
             db.add(BidCompanyMapping(
@@ -231,6 +232,7 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
                 match_score=score,
                 match_reason=reason[:1000],
                 match_keywords=kw_json,
+                reason_status="PENDING",
                 last_match_dt=now,
             ))
 

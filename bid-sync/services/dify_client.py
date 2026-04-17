@@ -10,7 +10,8 @@ logger = logging.getLogger(__name__)
 DIFY_API_URL = os.getenv("DIFY_API_URL", "https://api.dify.ai/v1")
 DIFY_API_KEY = os.getenv("DIFY_API_KEY", "")
 DIFY_DATASET_ID = os.getenv("DIFY_DATASET_ID", "")
-DIFY_WORKFLOW_KEY = os.getenv("DIFY_WORKFLOW_KEY", "")
+DIFY_KEYWORD_WORKFLOW_KEY = os.getenv("DIFY_KEYWORD_WORKFLOW_KEY", "")
+DIFY_REASON_WORKFLOW_KEY = os.getenv("DIFY_REASON_WORKFLOW_KEY", "")
 
 FIELD_IDS = {
     "bid_no":        "efda07c9-ee86-4f04-b32e-9d4abf7d6a4d",
@@ -78,7 +79,7 @@ async def run_keyword_workflow(bid_title: str, rfp_text: str) -> list[str]:
     출력: keywords 리스트
     """
     headers = {
-        "Authorization": f"Bearer {DIFY_WORKFLOW_KEY}",
+        "Authorization": f"Bearer {DIFY_KEYWORD_WORKFLOW_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
@@ -103,6 +104,53 @@ async def run_keyword_workflow(bid_title: str, rfp_text: str) -> list[str]:
 
     logger.info(f"키워드 추출 완료: {len(keywords)}개")
     return keywords
+
+
+async def run_reason_workflow(
+    bid_title: str,
+    bid_agency: str,
+    bid_amount: str,
+    service_type: str,
+    matched_keywords: list[str],
+    rag_segment: str,
+    match_score: float,
+) -> str:
+    """
+    추천 이유 생성 Dify 워크플로우 호출.
+    출력: reason (자연어 추천 이유 문자열)
+    """
+    headers = {
+        "Authorization": f"Bearer {DIFY_REASON_WORKFLOW_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "inputs": {
+            "bid_title":        bid_title,
+            "bid_agency":       bid_agency,
+            "bid_amount":       bid_amount,
+            "service_type":     service_type,
+            "matched_keywords": ", ".join(matched_keywords) if matched_keywords else "",
+            "rag_segment":      rag_segment,
+            "match_score":      str(round(match_score * 100, 1)),
+        },
+        "response_mode": "blocking",
+        "user": "bid-sync",
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            f"{DIFY_API_URL}/workflows/run",
+            headers=headers,
+            json=payload,
+        )
+        if not response.is_success:
+            logger.error(f"추천이유 워크플로우 오류: {response.status_code} | {response.text[:500]}")
+            response.raise_for_status()
+
+    outputs = response.json().get("data", {}).get("outputs", {})
+    reason = outputs.get("reason", "").strip()
+    logger.debug(f"추천이유 생성 완료: {bid_title[:30]}...")
+    return reason
 
 
 async def update_metadata(doc_id: str, fields: dict) -> None:

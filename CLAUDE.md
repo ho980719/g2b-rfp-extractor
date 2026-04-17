@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **`bid-sync/`** — 공고 sync + HWP/HWPX→PDF 변환 통합 서비스 (포트 8000)
 - **`logic/`** — Dify 코드 노드용 독립 Python 모듈
-- **루트 `main.py`** — 구버전 변환 서비스 (bid-sync로 통합됨, 미사용)
+- **루트 `main.py`** — 구버전** **변환 서비스 (bid-sync로 통합됨, 미사용)
 
 ---
 
