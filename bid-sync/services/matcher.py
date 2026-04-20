@@ -3,6 +3,7 @@ from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import and_, text
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from models import Bid, BidCompanyMapping
 from services.dify_client import retrieve_rag_scores
@@ -18,18 +19,20 @@ W_RFP_RAG  = 0.35
 # W_COMPANY_DOC = 0.10  # TODO
 
 
-def _get_item_codes(company_id: int, db: Session) -> list[str]:
+def _get_items(company_id: int, db: Session) -> dict[str, str]:
+    """품목코드 → 품목명 매핑 반환 {code: name}"""
     rows = db.execute(text("""
-        SELECT ITEM_CD FROM tb_company_item
+        SELECT ITEM_CD, ITEM_NM FROM tb_company_item
         WHERE COMPANY_ID = :cid AND USE_YN = 'Y'
     """), {"cid": company_id}).fetchall()
-    return [r[0] for r in rows]
+    return {r[0]: r[1] for r in rows}
 
 
-def _get_keywords(company_id: int, db: Session) -> tuple[set[str], list[str]]:
+def _get_keywords(company_id: int, db: Session) -> tuple[dict[str, str], list[str]]:
     """
-    (정규화된 키워드 set, 원본 키워드 list) 반환.
-    정규화: 매칭 비교용 / 원본: RAG 쿼리용
+    ({normalized: original_keyword_nm}, 원본 키워드 list) 반환.
+    - normalized_to_original: 매칭 비교용 (alias 포함, 매칭 시 원본명으로 역조회)
+    - originals: RAG 쿼리용 (키워드명만, 공백 유지)
     """
     rows = db.execute(text("""
         SELECT km.KEYWORD_NM
@@ -39,15 +42,25 @@ def _get_keywords(company_id: int, db: Session) -> tuple[set[str], list[str]]:
     """), {"cid": company_id}).fetchall()
 
     alias_rows = db.execute(text("""
-        SELECT ka.ALIAS_NM
+        SELECT ka.ALIAS_NM, km.KEYWORD_NM
         FROM tb_company_keyword ck
+        JOIN tb_keyword_master km ON ck.KEYWORD_ID = km.KEYWORD_ID
         JOIN tb_keyword_alias ka ON ck.KEYWORD_ID = ka.KEYWORD_ID
         WHERE ck.COMPANY_ID = :cid AND ck.USE_YN = 'Y' AND ka.USE_YN = 'Y'
     """), {"cid": company_id}).fetchall()
 
     originals = [r[0] for r in rows if r[0]]
-    normalized = {_normalize(r[0]) for r in rows + alias_rows if r[0]}
-    return normalized, originals
+
+    # normalized → 원본 키워드명 매핑 (alias도 원본 키워드명으로 역조회 가능하게)
+    normalized_to_original: dict[str, str] = {}
+    for r in rows:
+        if r[0]:
+            normalized_to_original[_normalize(r[0])] = r[0]
+    for alias_nm, keyword_nm in alias_rows:
+        if alias_nm:
+            normalized_to_original[_normalize(alias_nm)] = keyword_nm
+
+    return normalized_to_original, originals
 
 
 def _get_settings(company_id: int, db: Session) -> dict:
@@ -78,32 +91,36 @@ def _normalize(s: str) -> str:
     return s.replace(" ", "").lower()
 
 
-def _matches_item_code(bid_clsfctn_no: str | None, item_codes: list[str]) -> bool:
-    """전방 일치: 기업 품목코드가 공고 분류번호의 접두사이거나 같으면 매칭"""
+def _matched_item_codes(bid_clsfctn_no: str | None, item_codes: list[str]) -> list[str]:
+    """전방 일치: 매칭된 품목코드 목록 반환 (빈 리스트 = 미매칭)"""
     if not bid_clsfctn_no or not item_codes:
-        return False
-    for item_cd in item_codes:
-        if bid_clsfctn_no.startswith(item_cd) or item_cd.startswith(bid_clsfctn_no):
-            return True
-    return False
+        return []
+    return [
+        item_cd for item_cd in item_codes
+        if bid_clsfctn_no.startswith(item_cd) or item_cd.startswith(bid_clsfctn_no)
+    ]
 
 
-def _calc_keyword_score(bid_keywords: list[str], company_keywords: set[str]) -> tuple[list[str], float]:
-    """매칭된 키워드 목록과 점수 반환"""
+def _calc_keyword_score(bid_keywords: list[str], company_keywords: dict[str, str]) -> tuple[list[str], float]:
+    """
+    매칭된 원본 키워드명 목록과 점수 반환.
+    company_keywords: {normalized: original_nm} — alias 포함
+    """
     if not company_keywords or not bid_keywords:
         return [], 0.0
 
     normalized_bid = [_normalize(k) for k in bid_keywords]
-    matched = []
-    for ck in company_keywords:
-        if any(ck in bk or bk in ck for bk in normalized_bid):
-            matched.append(ck)
+    matched_originals: set[str] = set()
+    for norm_ck, original_nm in company_keywords.items():
+        if any(norm_ck in bk or bk in norm_ck for bk in normalized_bid):
+            matched_originals.add(original_nm)  # alias여도 원본 키워드명으로 저장
 
-    if not matched:
+    if not matched_originals:
         return [], 0.0
 
-    score = min(len(matched) / len(company_keywords), 1.0)
-    return matched, score
+    unique_keyword_count = len(set(company_keywords.values()))
+    score = min(len(matched_originals) / unique_keyword_count, 1.0)
+    return list(matched_originals), score
 
 
 def _get_active_bids(db: Session, settings: dict, company_id: int | None = None, new_only: bool = False) -> list[Bid]:
@@ -148,7 +165,8 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
     매칭 조건: 품목코드 OR 키워드 중 하나 이상 일치 후 RAG 점수 추가
     점수: W_ITEM(0.30) + W_KEYWORD(0.25) + W_RFP_RAG(0.35) = 최대 0.90
     """
-    item_codes = _get_item_codes(company_id, db)
+    items = _get_items(company_id, db)
+    item_codes = list(items.keys())
     keywords, keywords_raw = _get_keywords(company_id, db)
     settings = _get_settings(company_id, db)
     profile_summary = _get_profile_summary(company_id, db)
@@ -163,11 +181,11 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
     # 1단계: 품목코드 OR 키워드 필터링
     candidates = []
     for bid in bids:
-        item_matched = _matches_item_code(bid.bid_clsfctn_no, item_codes)
+        matched_items = _matched_item_codes(bid.bid_clsfctn_no, item_codes)
         matched_kws, kw_score = _calc_keyword_score(bid.keywords or [], keywords)
-        if not item_matched and not matched_kws:
+        if not matched_items and not matched_kws:
             continue
-        candidates.append((bid, item_matched, matched_kws, kw_score))
+        candidates.append((bid, matched_items, matched_kws, kw_score))
 
     logger.info(f"기업 {company_id}: 1차 필터 후 후보 {len(candidates)}건")
 
@@ -186,11 +204,11 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
             logger.warning(f"RAG 점수 조회 실패 (무시): {e}")
 
     # 3단계: 최종 점수 계산 + upsert
-    now = datetime.utcnow()
+    now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
     matched_count = 0
 
-    for bid, item_matched, matched_kws, kw_score in candidates:
-        item_score = W_ITEM if item_matched else 0.0
+    for bid, matched_items, matched_kws, kw_score in candidates:
+        item_score = W_ITEM if matched_items else 0.0
         rag_hit = rag_results.get(bid.dify_doc_id) if bid.dify_doc_id else None
         raw_rag = rag_hit["score"] if rag_hit else 0.0
         # Dify 한국어 유사도는 0.2~0.6 범위 > 0~1로 리스케일 (0.2 이하=0, 0.6 이상=1)
@@ -198,7 +216,7 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
         score = round(item_score + kw_score * W_KEYWORD + rag_score * W_RFP_RAG, 4)
 
         reasons = []
-        if item_matched:
+        if matched_items:
             reasons.append(f"품목코드({bid.bid_clsfctn_no})")
         if matched_kws:
             reasons.append(f"키워드({', '.join(matched_kws[:5])})")
@@ -206,8 +224,15 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
             reasons.append(f"RAG({rag_score:.2f})")
         reason = " + ".join(reasons)
 
-        # match_keywords: {"keywords": [...], "rag": {"score": float, "segment": str}}
-        kw_json: dict = {"keywords": matched_kws}
+        # 매칭된 품목코드 → 품목명 변환 후 keywords 배열에 합산
+        matched_item_names = [items[code] for code in matched_items if code in items]
+
+        # match_keywords: {"items": [...], "item_names": [...], "keywords": [...], "rag": {...}}
+        kw_json: dict = {
+            "items":      matched_items,
+            "item_names": matched_item_names,
+            "keywords":   matched_item_names + matched_kws,
+        }
         if rag_hit and rag_hit["score"] > 0:
             kw_json["rag"] = {"score": round(raw_rag, 4), "segment": rag_hit["segment"]}
 
@@ -222,7 +247,8 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
             existing.match_reason = reason[:1000]
             existing.match_keywords = kw_json
             existing.reason_status = "PENDING"
-            existing.last_match_dt = now
+            existing.last_match_dt = now_kst
+            flag_modified(existing, "match_keywords")
         else:
             db.add(BidCompanyMapping(
                 company_id=company_id,
@@ -233,7 +259,7 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
                 match_reason=reason[:1000],
                 match_keywords=kw_json,
                 reason_status="PENDING",
-                last_match_dt=now,
+                last_match_dt=now_kst,
             ))
 
         matched_count += 1
