@@ -58,6 +58,12 @@ async def extract_keywords(limit: int = 10, db: Session = Depends(get_db)):
                     rfp_text=rfp_text,
                 )
 
+                if not keywords:
+                    bid.keyword_status = "FAILED"
+                    failed += 1
+                    logger.warning(f"키워드 추출 빈 배열 반환: {bid.bid_ntce_no}")
+                    continue
+
                 bid.keywords = keywords
                 bid.keyword_status = "DONE"
                 bid.keyword_extracted_at = datetime.utcnow()

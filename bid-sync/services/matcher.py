@@ -7,15 +7,16 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from models import Bid, BidCompanyMapping
 from services.dify_client import retrieve_rag_scores
+from services.usage_limiter import get_plan_limits, get_today_usage, increment_usage
 
 logger = logging.getLogger(__name__)
 
 KST = timezone(timedelta(hours=9))
 
-# 가중치
-W_ITEM     = 0.30
-W_KEYWORD  = 0.25
-W_RFP_RAG  = 0.35
+# 가중치 (합 = 1.0)
+W_ITEM     = 0.40
+W_KEYWORD  = 0.35
+W_RFP_RAG  = 0.25
 # W_COMPANY_DOC = 0.10  # TODO
 
 
@@ -101,19 +102,32 @@ def _matched_item_codes(bid_clsfctn_no: str | None, item_codes: list[str]) -> li
     ]
 
 
-def _calc_keyword_score(bid_keywords: list[str], company_keywords: dict[str, str]) -> tuple[list[str], float]:
+def _calc_keyword_score(
+    bid_keywords: list[str],
+    company_keywords: dict[str, str],
+    bid_ntce_nm: str = "",
+) -> tuple[list[str], float]:
     """
     매칭된 원본 키워드명 목록과 점수 반환.
     company_keywords: {normalized: original_nm} — alias 포함
+    bid_ntce_nm: LLM 키워드가 부실할 때 공고명 직접 매칭 보조 사용
     """
-    if not company_keywords or not bid_keywords:
+    if not company_keywords:
         return [], 0.0
 
+    # LLM 추출 키워드 정규화
     normalized_bid = [_normalize(k) for k in bid_keywords]
+    # 공고명도 정규화해서 fallback 소스로 추가
+    normalized_title = _normalize(bid_ntce_nm) if bid_ntce_nm else ""
+
     matched_originals: set[str] = set()
     for norm_ck, original_nm in company_keywords.items():
-        if any(norm_ck in bk or bk in norm_ck for bk in normalized_bid):
-            matched_originals.add(original_nm)  # alias여도 원본 키워드명으로 저장
+        # 1순위: LLM 추출 키워드와 매칭
+        if normalized_bid and any(norm_ck in bk or bk in norm_ck for bk in normalized_bid):
+            matched_originals.add(original_nm)
+        # 2순위: 공고명에 직접 포함 여부 (LLM 추출 실패 보완)
+        elif normalized_title and norm_ck in normalized_title:
+            matched_originals.add(original_nm)
 
     if not matched_originals:
         return [], 0.0
@@ -165,6 +179,19 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
     매칭 조건: 품목코드 OR 키워드 중 하나 이상 일치 후 RAG 점수 추가
     점수: W_ITEM(0.30) + W_KEYWORD(0.25) + W_RFP_RAG(0.35) = 최대 0.90
     """
+    # 구독 플랜 확인 — 구독 없으면 매칭 스킵
+    limits = get_plan_limits(company_id, db)
+    if limits is None:
+        logger.info(f"기업 {company_id}: 활성 구독 없음, 스킵")
+        return {"company_id": company_id, "matched": 0, "skipped": True, "reason": "no_subscription"}
+
+    bid_recommend_limit = limits["BID_RECOMMEND"]  # None = 무제한
+    today_usage = get_today_usage(company_id, "BID_RECOMMEND", db) if bid_recommend_limit is not None else 0
+
+    if bid_recommend_limit is not None and today_usage >= bid_recommend_limit:
+        logger.info(f"기업 {company_id}: BID_RECOMMEND 일 한도 초과 ({today_usage}/{bid_recommend_limit}), 스킵")
+        return {"company_id": company_id, "matched": 0, "skipped": True, "reason": "limit_exceeded"}
+
     items = _get_items(company_id, db)
     item_codes = list(items.keys())
     keywords, keywords_raw = _get_keywords(company_id, db)
@@ -173,7 +200,7 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
 
     if not item_codes and not keywords:
         logger.info(f"기업 {company_id}: 품목코드/키워드 없음, 스킵")
-        return {"company_id": company_id, "matched": 0, "skipped": True}
+        return {"company_id": company_id, "matched": 0, "skipped": True, "reason": "no_items_keywords"}
 
     bids = _get_active_bids(db, settings, company_id=company_id, new_only=new_only)
     logger.info(f"기업 {company_id}: 활성 공고 {len(bids)}건 대상 매칭 시작")
@@ -182,7 +209,7 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
     candidates = []
     for bid in bids:
         matched_items = _matched_item_codes(bid.bid_clsfctn_no, item_codes)
-        matched_kws, kw_score = _calc_keyword_score(bid.keywords or [], keywords)
+        matched_kws, kw_score = _calc_keyword_score(bid.keywords or [], keywords, bid.bid_ntce_nm or "")
         if not matched_items and not matched_kws:
             continue
         candidates.append((bid, matched_items, matched_kws, kw_score))
@@ -206,6 +233,7 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
     # 3단계: 최종 점수 계산 + upsert
     now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
     matched_count = 0
+    new_recommend_count = 0  # 신규 추천 건수 (기존 업데이트 제외)
 
     for bid, matched_items, matched_kws, kw_score in candidates:
         item_score = W_ITEM if matched_items else 0.0
@@ -242,6 +270,19 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
             bid_ntce_ord=bid.bid_ntce_ord,
         ).first()
 
+        # 40% 미만은 저장 제외 (기존 레코드 있으면 삭제)
+        if score < 0.40:
+            if existing:
+                db.delete(existing)
+            continue
+
+        # 신규 추천 시 일 한도 체크 (기존 매핑 업데이트는 한도 차감 없음)
+        if not existing:
+            if bid_recommend_limit is not None and today_usage + new_recommend_count >= bid_recommend_limit:
+                logger.info(f"기업 {company_id}: BID_RECOMMEND 일 한도 도달 ({bid_recommend_limit}건), 이후 신규 추천 중단")
+                continue
+            new_recommend_count += 1
+
         if existing:
             existing.match_score = score
             existing.match_reason = reason[:1000]
@@ -264,6 +305,9 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
 
         matched_count += 1
 
+    # 신규 추천 건수만큼 사용량 증가
+    increment_usage(company_id, "BID_RECOMMEND", new_recommend_count, db)
+
     db.commit()
-    logger.info(f"기업 {company_id}: 매칭 완료 {matched_count}건")
+    logger.info(f"기업 {company_id}: 매칭 완료 {matched_count}건 (신규 {new_recommend_count}건 추천 카운트)")
     return {"company_id": company_id, "matched": matched_count}
