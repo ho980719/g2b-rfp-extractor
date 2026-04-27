@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime, timezone, timedelta
 
-from sqlalchemy import and_, text
+from sqlalchemy import and_, or_, text
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -16,8 +16,8 @@ KST = timezone(timedelta(hours=9))
 # 가중치 (합 = 1.0)
 W_ITEM     = 0.40
 W_KEYWORD  = 0.35
-W_RFP_RAG  = 0.25
-# W_COMPANY_DOC = 0.10  # TODO
+W_PROFILE  = 0.10
+W_RFP_RAG  = 0.15
 
 
 def _get_items(company_id: int, db: Session) -> dict[str, str]:
@@ -88,6 +88,40 @@ def _get_profile_summary(company_id: int, db: Session) -> str:
     return row[0] if row and row[0] else ""
 
 
+def _get_profile_keywords(company_id: int, db: Session) -> list[str]:
+    """
+    tb_company_profile에서 프로필 키워드 파싱.
+    - BUSINESS_AREA: 쉼표 구분 모든 토큰
+    - SOLUTION_TECH_AREA: ≤20자 토큰만 (설명 문장 필터링)
+    """
+    row = db.execute(text("""
+        SELECT BUSINESS_AREA, SOLUTION_TECH_AREA FROM tb_company_profile
+        WHERE COMPANY_ID = :cid AND USE_YN = 'Y'
+    """), {"cid": company_id}).fetchone()
+    if not row:
+        return []
+
+    keywords: list[str] = []
+    if row[0]:
+        for token in row[0].split(","):
+            token = token.strip()
+            if token:
+                keywords.append(token)
+    if row[1]:
+        for token in row[1].split(","):
+            token = token.strip()
+            if token and len(token) <= 20:
+                keywords.append(token)
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for kw in keywords:
+        if kw not in seen:
+            seen.add(kw)
+            result.append(kw)
+    return result
+
+
 def _normalize(s: str) -> str:
     return s.replace(" ", "").lower()
 
@@ -135,6 +169,36 @@ def _calc_keyword_score(
     unique_keyword_count = len(set(company_keywords.values()))
     score = min(len(matched_originals) / unique_keyword_count, 1.0)
     return list(matched_originals), score
+
+
+def _calc_profile_keyword_score(
+    bid_keywords: list[str],
+    bid_title: str,
+    profile_keywords: list[str],
+) -> tuple[list[str], float]:
+    """
+    프로필 키워드(BUSINESS_AREA + SOLUTION_TECH_AREA)와 공고 키워드/공고명 매칭.
+    반환: (matched_keywords, score 0~1)
+    """
+    if not profile_keywords:
+        return [], 0.0
+
+    normalized_bid = [_normalize(k) for k in bid_keywords]
+    normalized_title = _normalize(bid_title) if bid_title else ""
+
+    matched: set[str] = set()
+    for pk in profile_keywords:
+        norm_pk = _normalize(pk)
+        if normalized_bid and any(norm_pk in bk or bk in norm_pk for bk in normalized_bid):
+            matched.add(pk)
+        elif normalized_title and norm_pk in normalized_title:
+            matched.add(pk)
+
+    if not matched:
+        return [], 0.0
+
+    score = min(len(matched) / len(profile_keywords), 1.0)
+    return list(matched), score
 
 
 def _get_active_bids(db: Session, settings: dict, company_id: int | None = None, new_only: bool = False) -> list[Bid]:
@@ -197,28 +261,31 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
     keywords, keywords_raw = _get_keywords(company_id, db)
     settings = _get_settings(company_id, db)
     profile_summary = _get_profile_summary(company_id, db)
+    profile_kws = _get_profile_keywords(company_id, db)
 
-    if not item_codes and not keywords:
+    if not item_codes and not keywords and not profile_kws:
         logger.info(f"기업 {company_id}: 품목코드/키워드 없음, 스킵")
         return {"company_id": company_id, "matched": 0, "skipped": True, "reason": "no_items_keywords"}
 
     bids = _get_active_bids(db, settings, company_id=company_id, new_only=new_only)
     logger.info(f"기업 {company_id}: 활성 공고 {len(bids)}건 대상 매칭 시작")
 
-    # 1단계: 품목코드 OR 키워드 필터링
+    # 1단계: 품목코드 OR 키워드 OR 프로필 키워드 필터링
     candidates = []
     for bid in bids:
         matched_items = _matched_item_codes(bid.bid_clsfctn_no, item_codes)
         matched_kws, kw_score = _calc_keyword_score(bid.keywords or [], keywords, bid.bid_ntce_nm or "")
-        if not matched_items and not matched_kws:
+        matched_profile_kws, profile_score = _calc_profile_keyword_score(
+            bid.keywords or [], bid.bid_ntce_nm or "", profile_kws
+        )
+        if not matched_items and not matched_kws and not matched_profile_kws:
             continue
-        candidates.append((bid, matched_items, matched_kws, kw_score))
+        candidates.append((bid, matched_items, matched_kws, kw_score, matched_profile_kws, profile_score))
 
     logger.info(f"기업 {company_id}: 1차 필터 후 후보 {len(candidates)}건")
 
     # 2단계: 후보 대상 Dify RAG 점수 조회
-    # 원본 키워드(공백 유지)로 쿼리 — 정규화된 키워드는 임베딩 품질 저하
-    rag_query = " ".join(keywords_raw[:10])
+    rag_query = " ".join(keywords_raw[:10] + profile_kws[:5])
     if profile_summary:
         rag_query = f"{profile_summary[:300]} {rag_query}"
 
@@ -235,19 +302,23 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
     matched_count = 0
     new_recommend_count = 0  # 신규 추천 건수 (기존 업데이트 제외)
 
-    for bid, matched_items, matched_kws, kw_score in candidates:
+    for bid, matched_items, matched_kws, kw_score, matched_profile_kws, profile_score in candidates:
         item_score = W_ITEM if matched_items else 0.0
         rag_hit = rag_results.get(bid.dify_doc_id) if bid.dify_doc_id else None
         raw_rag = rag_hit["score"] if rag_hit else 0.0
         # Dify 한국어 유사도는 0.2~0.6 범위 > 0~1로 리스케일 (0.2 이하=0, 0.6 이상=1)
         rag_score = max(0.0, min(1.0, (raw_rag - 0.2) / 0.4))
-        score = round(item_score + kw_score * W_KEYWORD + rag_score * W_RFP_RAG, 4)
+        score = round(
+            item_score + kw_score * W_KEYWORD + profile_score * W_PROFILE + rag_score * W_RFP_RAG, 4
+        )
 
         reasons = []
         if matched_items:
             reasons.append(f"품목코드({bid.bid_clsfctn_no})")
         if matched_kws:
             reasons.append(f"키워드({', '.join(matched_kws[:5])})")
+        if matched_profile_kws:
+            reasons.append(f"프로필({', '.join(matched_profile_kws[:3])})")
         if rag_score > 0:
             reasons.append(f"RAG({rag_score:.2f})")
         reason = " + ".join(reasons)
@@ -255,11 +326,12 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
         # 매칭된 품목코드 → 품목명 변환 후 keywords 배열에 합산
         matched_item_names = [items[code] for code in matched_items if code in items]
 
-        # match_keywords: {"items": [...], "item_names": [...], "keywords": [...], "rag": {...}}
+        # match_keywords: {"items": [...], "item_names": [...], "keywords": [...], "profile_keywords": [...], "rag": {...}}
         kw_json: dict = {
-            "items":      matched_items,
-            "item_names": matched_item_names,
-            "keywords":   matched_item_names + matched_kws,
+            "items":            matched_items,
+            "item_names":       matched_item_names,
+            "keywords":         matched_item_names + matched_kws,
+            "profile_keywords": matched_profile_kws,
         }
         if rag_hit and rag_hit["score"] > 0:
             kw_json["rag"] = {"score": round(raw_rag, 4), "segment": rag_hit["segment"]}
@@ -340,7 +412,6 @@ def _get_active_pre_specs(db: Session, settings: dict, company_id: int | None = 
     - opnin_rgst_clse_dt 미래 또는 NULL (아직 의견 접수 가능)
     """
     now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-    from sqlalchemy import or_
     query = db.query(PreSpec).filter(
         PreSpec.keyword_status.in_(["DONE", "FAILED"]),
         or_(PreSpec.opnin_rgst_clse_dt == None, PreSpec.opnin_rgst_clse_dt > now_kst),
@@ -387,15 +458,16 @@ async def match_company_pre_spec(company_id: int, db: Session, new_only: bool = 
     keywords, keywords_raw = _get_keywords(company_id, db)
     settings = _get_settings(company_id, db)
     profile_summary = _get_profile_summary(company_id, db)
+    profile_kws = _get_profile_keywords(company_id, db)
 
-    if not item_codes and not keywords:
+    if not item_codes and not keywords and not profile_kws:
         logger.info(f"기업 {company_id}: 품목코드/키워드 없음 (사전규격), 스킵")
         return {"company_id": company_id, "matched": 0, "skipped": True, "reason": "no_items_keywords"}
 
     pre_specs = _get_active_pre_specs(db, settings, company_id=company_id, new_only=new_only)
     logger.info(f"기업 {company_id}: 활성 사전규격 {len(pre_specs)}건 대상 매칭 시작")
 
-    # 1단계: 품목코드 OR 키워드 필터링
+    # 1단계: 품목코드 OR 키워드 OR 프로필 키워드 필터링
     candidates = []
     for ps in pre_specs:
         ps_items = _parse_prdct_dtl_list(ps.prdct_dtl_list)
@@ -413,15 +485,18 @@ async def match_company_pre_spec(company_id: int, db: Session, new_only: bool = 
             keywords,
             ps.prdct_clsfc_no_nm or "",
         )
+        matched_profile_kws, profile_score = _calc_profile_keyword_score(
+            ps.keywords or [], ps.prdct_clsfc_no_nm or "", profile_kws
+        )
 
-        if not matched_items and not matched_kws:
+        if not matched_items and not matched_kws and not matched_profile_kws:
             continue
-        candidates.append((ps, ps_items, matched_items, matched_kws, kw_score))
+        candidates.append((ps, ps_items, matched_items, matched_kws, kw_score, matched_profile_kws, profile_score))
 
     logger.info(f"기업 {company_id}: 사전규격 1차 필터 후 후보 {len(candidates)}건")
 
     # 2단계: 후보 대상 Dify RAG 점수 조회
-    rag_query = " ".join(keywords_raw[:10])
+    rag_query = " ".join(keywords_raw[:10] + profile_kws[:5])
     if profile_summary:
         rag_query = f"{profile_summary[:300]} {rag_query}"
 
@@ -438,18 +513,22 @@ async def match_company_pre_spec(company_id: int, db: Session, new_only: bool = 
     matched_count = 0
     new_recommend_count = 0
 
-    for ps, ps_items, matched_items, matched_kws, kw_score in candidates:
+    for ps, ps_items, matched_items, matched_kws, kw_score, matched_profile_kws, profile_score in candidates:
         item_score = W_ITEM if matched_items else 0.0
         rag_hit = rag_results.get(ps.dify_doc_id) if ps.dify_doc_id else None
         raw_rag = rag_hit["score"] if rag_hit else 0.0
         rag_score = max(0.0, min(1.0, (raw_rag - 0.2) / 0.4))
-        score = round(item_score + kw_score * W_KEYWORD + rag_score * W_RFP_RAG, 4)
+        score = round(
+            item_score + kw_score * W_KEYWORD + profile_score * W_PROFILE + rag_score * W_RFP_RAG, 4
+        )
 
         reasons = []
         if matched_items:
             reasons.append(f"품목코드({', '.join(matched_items[:3])})")
         if matched_kws:
             reasons.append(f"키워드({', '.join(matched_kws[:5])})")
+        if matched_profile_kws:
+            reasons.append(f"프로필({', '.join(matched_profile_kws[:3])})")
         if rag_score > 0:
             reasons.append(f"RAG({rag_score:.2f})")
         reason = " + ".join(reasons)
@@ -457,9 +536,10 @@ async def match_company_pre_spec(company_id: int, db: Session, new_only: bool = 
         matched_item_names = [items[code] for code in matched_items if code in items]
 
         kw_json: dict = {
-            "items":      matched_items,
-            "item_names": matched_item_names,
-            "keywords":   matched_item_names + matched_kws,
+            "items":            matched_items,
+            "item_names":       matched_item_names,
+            "keywords":         matched_item_names + matched_kws,
+            "profile_keywords": matched_profile_kws,
         }
         if rag_hit and rag_hit["score"] > 0:
             kw_json["rag"] = {"score": round(raw_rag, 4), "segment": rag_hit["segment"]}
