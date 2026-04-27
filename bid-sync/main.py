@@ -3,7 +3,7 @@ import os
 
 from fastapi import FastAPI
 
-from router import bids, convert, process, extract, matching
+from router import bids, convert, process, extract, matching, pre_specs
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -24,6 +24,7 @@ app.include_router(convert.router)
 app.include_router(process.router)
 app.include_router(extract.router)
 app.include_router(matching.router)
+app.include_router(pre_specs.router)
 
 
 @app.get("/health")

@@ -5,8 +5,8 @@ from sqlalchemy import and_, text
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
-from models import Bid, BidCompanyMapping
-from services.dify_client import retrieve_rag_scores
+from models import Bid, BidCompanyMapping, PreSpec, PreSpecCompanyMapping
+from services.dify_client import retrieve_rag_scores, retrieve_pre_spec_rag_scores
 from services.usage_limiter import get_plan_limits, get_today_usage, increment_usage
 
 logger = logging.getLogger(__name__)
@@ -310,4 +310,198 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
 
     db.commit()
     logger.info(f"기업 {company_id}: 매칭 완료 {matched_count}건 (신규 {new_recommend_count}건 추천 카운트)")
+    return {"company_id": company_id, "matched": matched_count}
+
+
+def _parse_prdct_dtl_list(prdct_dtl_list: str | None) -> dict[str, str]:
+    """
+    '[1^4321150102^컴퓨터서비스],[2^4321150901^자동화컴퓨터]' 형식 파싱.
+    반환: {품목코드: 품목명}
+    """
+    if not prdct_dtl_list:
+        return {}
+    result = {}
+    # 대괄호 안 내용 추출
+    import re
+    for match in re.finditer(r'\[([^\]]+)\]', prdct_dtl_list):
+        parts = match.group(1).split("^")
+        if len(parts) >= 3:
+            code = parts[1].strip()
+            name = parts[2].strip()
+            if code:
+                result[code] = name
+    return result
+
+
+def _get_active_pre_specs(db: Session, settings: dict, company_id: int | None = None, new_only: bool = False) -> list[PreSpec]:
+    """
+    매칭 대상 사전규격 조회.
+    - keyword_status IN (DONE, FAILED) — FAILED도 공고명 fallback 매칭 가능
+    - opnin_rgst_clse_dt 미래 또는 NULL (아직 의견 접수 가능)
+    """
+    now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    from sqlalchemy import or_
+    query = db.query(PreSpec).filter(
+        PreSpec.keyword_status.in_(["DONE", "FAILED"]),
+        or_(PreSpec.opnin_rgst_clse_dt == None, PreSpec.opnin_rgst_clse_dt > now_kst),
+    )
+
+    if new_only and company_id is not None:
+        matched_sub = (
+            db.query(PreSpecCompanyMapping.bf_spec_rgst_no)
+            .filter(PreSpecCompanyMapping.company_id == company_id)
+            .subquery()
+        )
+        query = query.outerjoin(
+            matched_sub,
+            PreSpec.bf_spec_rgst_no == matched_sub.c.bf_spec_rgst_no,
+        ).filter(matched_sub.c.bf_spec_rgst_no == None)
+
+    if settings.get("budget_min"):
+        query = query.filter(PreSpec.asign_bdgt_amt >= int(settings["budget_min"]))
+    if settings.get("budget_max"):
+        query = query.filter(PreSpec.asign_bdgt_amt <= int(settings["budget_max"]))
+
+    return query.all()
+
+
+async def match_company_pre_spec(company_id: int, db: Session, new_only: bool = False) -> dict:
+    """
+    단일 기업 기준 사전규격 매칭 실행 후 tb_pre_specs_company_mapping upsert.
+    기존 match_company()와 동일한 가중치/임계값 적용.
+    """
+    limits = get_plan_limits(company_id, db)
+    if limits is None:
+        logger.info(f"기업 {company_id}: 활성 구독 없음 (사전규격), 스킵")
+        return {"company_id": company_id, "matched": 0, "skipped": True, "reason": "no_subscription"}
+
+    prespec_limit = limits.get("PRESPEC_RECOMMEND")  # None = 무제한
+    today_usage = get_today_usage(company_id, "PRESPEC_RECOMMEND", db) if prespec_limit is not None else 0
+
+    if prespec_limit is not None and today_usage >= prespec_limit:
+        logger.info(f"기업 {company_id}: PRESPEC_RECOMMEND 일 한도 초과 ({today_usage}/{prespec_limit}), 스킵")
+        return {"company_id": company_id, "matched": 0, "skipped": True, "reason": "limit_exceeded"}
+
+    items = _get_items(company_id, db)
+    item_codes = list(items.keys())
+    keywords, keywords_raw = _get_keywords(company_id, db)
+    settings = _get_settings(company_id, db)
+    profile_summary = _get_profile_summary(company_id, db)
+
+    if not item_codes and not keywords:
+        logger.info(f"기업 {company_id}: 품목코드/키워드 없음 (사전규격), 스킵")
+        return {"company_id": company_id, "matched": 0, "skipped": True, "reason": "no_items_keywords"}
+
+    pre_specs = _get_active_pre_specs(db, settings, company_id=company_id, new_only=new_only)
+    logger.info(f"기업 {company_id}: 활성 사전규격 {len(pre_specs)}건 대상 매칭 시작")
+
+    # 1단계: 품목코드 OR 키워드 필터링
+    candidates = []
+    for ps in pre_specs:
+        ps_items = _parse_prdct_dtl_list(ps.prdct_dtl_list)
+        ps_item_codes = list(ps_items.keys())
+
+        # 사전규격 품목코드 매칭 (각 품목코드에 대해 전방 일치)
+        matched_items = []
+        for ps_code in ps_item_codes:
+            matched = _matched_item_codes(ps_code, item_codes)
+            matched_items.extend(matched)
+        matched_items = list(set(matched_items))
+
+        matched_kws, kw_score = _calc_keyword_score(
+            ps.keywords or [],
+            keywords,
+            ps.prdct_clsfc_no_nm or "",
+        )
+
+        if not matched_items and not matched_kws:
+            continue
+        candidates.append((ps, ps_items, matched_items, matched_kws, kw_score))
+
+    logger.info(f"기업 {company_id}: 사전규격 1차 필터 후 후보 {len(candidates)}건")
+
+    # 2단계: 후보 대상 Dify RAG 점수 조회
+    rag_query = " ".join(keywords_raw[:10])
+    if profile_summary:
+        rag_query = f"{profile_summary[:300]} {rag_query}"
+
+    doc_ids = [ps.dify_doc_id for ps, *_ in candidates if ps.dify_doc_id]
+    rag_results: dict[str, dict] = {}
+    if doc_ids:
+        try:
+            rag_results = await retrieve_pre_spec_rag_scores(rag_query, doc_ids)
+        except Exception as e:
+            logger.warning(f"사전규격 RAG 점수 조회 실패 (무시): {e}")
+
+    # 3단계: 최종 점수 계산 + upsert
+    now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    matched_count = 0
+    new_recommend_count = 0
+
+    for ps, ps_items, matched_items, matched_kws, kw_score in candidates:
+        item_score = W_ITEM if matched_items else 0.0
+        rag_hit = rag_results.get(ps.dify_doc_id) if ps.dify_doc_id else None
+        raw_rag = rag_hit["score"] if rag_hit else 0.0
+        rag_score = max(0.0, min(1.0, (raw_rag - 0.2) / 0.4))
+        score = round(item_score + kw_score * W_KEYWORD + rag_score * W_RFP_RAG, 4)
+
+        reasons = []
+        if matched_items:
+            reasons.append(f"품목코드({', '.join(matched_items[:3])})")
+        if matched_kws:
+            reasons.append(f"키워드({', '.join(matched_kws[:5])})")
+        if rag_score > 0:
+            reasons.append(f"RAG({rag_score:.2f})")
+        reason = " + ".join(reasons)
+
+        matched_item_names = [items[code] for code in matched_items if code in items]
+
+        kw_json: dict = {
+            "items":      matched_items,
+            "item_names": matched_item_names,
+            "keywords":   matched_item_names + matched_kws,
+        }
+        if rag_hit and rag_hit["score"] > 0:
+            kw_json["rag"] = {"score": round(raw_rag, 4), "segment": rag_hit["segment"]}
+
+        existing = db.query(PreSpecCompanyMapping).filter_by(
+            company_id=company_id,
+            bf_spec_rgst_no=ps.bf_spec_rgst_no,
+        ).first()
+
+        if score < 0.40:
+            if existing:
+                db.delete(existing)
+            continue
+
+        if not existing:
+            if prespec_limit is not None and today_usage + new_recommend_count >= prespec_limit:
+                logger.info(f"기업 {company_id}: PRESPEC_RECOMMEND 일 한도 도달 ({prespec_limit}건), 이후 신규 추천 중단")
+                continue
+            new_recommend_count += 1
+
+        if existing:
+            existing.match_score = score
+            existing.match_reason = reason[:1000]
+            existing.match_keywords = kw_json
+            existing.reason_status = "PENDING"
+            existing.last_match_dt = now_kst
+            flag_modified(existing, "match_keywords")
+        else:
+            db.add(PreSpecCompanyMapping(
+                company_id=company_id,
+                bf_spec_rgst_no=ps.bf_spec_rgst_no,
+                match_type_cd="AI",
+                match_score=score,
+                match_reason=reason[:1000],
+                match_keywords=kw_json,
+                reason_status="PENDING",
+                last_match_dt=now_kst,
+            ))
+
+        matched_count += 1
+
+    increment_usage(company_id, "PRESPEC_RECOMMEND", new_recommend_count, db)
+    db.commit()
+    logger.info(f"기업 {company_id}: 사전규격 매칭 완료 {matched_count}건 (신규 {new_recommend_count}건)")
     return {"company_id": company_id, "matched": matched_count}

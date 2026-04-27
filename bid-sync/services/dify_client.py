@@ -10,9 +10,11 @@ logger = logging.getLogger(__name__)
 DIFY_API_URL = os.getenv("DIFY_API_URL", "https://api.dify.ai/v1")
 DIFY_API_KEY = os.getenv("DIFY_API_KEY", "")
 DIFY_DATASET_ID = os.getenv("DIFY_DATASET_ID", "")
+DIFY_PRE_SPEC_DATASET_ID = os.getenv("DIFY_PRE_SPEC_DATASET_ID", "")  # 사전규격 전용 지식DB
 DIFY_KEYWORD_WORKFLOW_KEY = os.getenv("DIFY_KEYWORD_WORKFLOW_KEY", "")
 DIFY_REASON_WORKFLOW_KEY = os.getenv("DIFY_REASON_WORKFLOW_KEY", "")
 
+# 입찰공고 지식DB 메타데이터 필드 ID
 FIELD_IDS = {
     "bid_no":        "efda07c9-ee86-4f04-b32e-9d4abf7d6a4d",
     "bid_ord":       "35af4325-21ec-4f17-a635-1a69e490c777",
@@ -27,6 +29,18 @@ FIELD_IDS = {
     "bid_clse_dt":   "e277352e-4672-45b5-b3bb-fd1d38937f5b",
     "keywords":      "7bf6efcb-9aac-4914-9a4e-bcef863ecf41",
     "bid_clsfctn_no": "42ffdf20-443c-4455-850e-9093b6b1279c",
+}
+
+# 사전규격 지식DB 메타데이터 필드 ID
+PRE_SPEC_FIELD_IDS: dict[str, str] = {
+    "bid_no":      "6b031b37-c912-47fa-8c5c-36abf54784a6",
+    "bid_kind":    "d0b7946b-8605-4070-9517-4ef5861802a3",
+    "bid_title":   "96b7015c-294e-4366-b76f-8626464a4b3a",
+    "org_name":    "d663451e-aa70-43b3-912f-eb9305f8e09c",
+    "bid_date":    "ca80ee60-80d3-4e9b-b3e3-233291f43d57",
+    "bid_clse_dt": "6c4af0e0-ebe9-4568-8fd7-dafdf795e4fd",
+    "budget":      "eceb7443-f11b-4927-bff3-791820856a81",
+    "keywords":    "7f6515ba-135d-4974-969b-8ef90a051bad",
 }
 
 
@@ -67,6 +81,45 @@ async def upload_to_knowledge(pdf_path: Path, bid) -> str:
         "detail_url":    bid.detail_url or "",
         "bid_clse_dt":   bid.bid_clse_dt or "",
         "bid_clsfctn_no": bid.bid_clsfctn_no or "",
+    })
+
+    return doc_id
+
+
+async def upload_pre_spec_to_knowledge(pdf_path, pre_spec) -> str:
+    """사전규격 규격문서 PDF를 사전규격 전용 Dify 지식DB에 업로드 후 document_id 반환"""
+    if not DIFY_PRE_SPEC_DATASET_ID:
+        raise ValueError("DIFY_PRE_SPEC_DATASET_ID 환경변수가 설정되지 않았습니다.")
+
+    headers = {"Authorization": f"Bearer {DIFY_API_KEY}"}
+    data = {
+        "indexing_technique": "high_quality",
+        "process_rule": {"mode": "automatic"},
+    }
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        unique_name = f"PS_{pre_spec.bf_spec_rgst_no}.pdf"
+        with open(pdf_path, "rb") as f:
+            response = await client.post(
+                f"{DIFY_API_URL}/datasets/{DIFY_PRE_SPEC_DATASET_ID}/document/create-by-file",
+                headers=headers,
+                files={"file": (unique_name, f, "application/pdf")},
+                data={"data": json.dumps(data, ensure_ascii=False)},
+            )
+        response.raise_for_status()
+
+    doc_id = response.json()["document"]["id"]
+    logger.info(f"Dify 업로드 완료 (사전규격): {pre_spec.bf_spec_rgst_no} → doc_id={doc_id}")
+
+    await update_pre_spec_metadata(doc_id, {
+        "bid_no":      pre_spec.bf_spec_rgst_no or "",
+        "bid_ord":     "",
+        "bid_kind":    "사전규격",
+        "bid_title":   pre_spec.prdct_clsfc_no_nm or "",
+        "org_name":    pre_spec.order_instt_nm or "",
+        "bid_date":    pre_spec.rcpt_dt.strftime("%Y-%m-%d %H:%M:%S") if pre_spec.rcpt_dt else "",
+        "bid_clse_dt": pre_spec.opnin_rgst_clse_dt.strftime("%Y-%m-%d %H:%M:%S") if pre_spec.opnin_rgst_clse_dt else "",
+        "budget":      str(pre_spec.asign_bdgt_amt or ""),
     })
 
     return doc_id
@@ -155,18 +208,27 @@ async def run_reason_workflow(
     return reason
 
 
-async def update_metadata(doc_id: str, fields: dict) -> None:
-    """
-    Dify 문서 메타데이터 값 업데이트.
-    fields: {"keywords": "...", ...}
-    POST /datasets/{dataset_id}/documents/metadata
-    """
+async def update_pre_spec_metadata(doc_id: str, fields: dict) -> None:
+    """사전규격 전용 지식DB 문서 메타데이터 업데이트."""
+    await _update_metadata_for_dataset(DIFY_PRE_SPEC_DATASET_ID, doc_id, fields, PRE_SPEC_FIELD_IDS)
+
+
+async def retrieve_pre_spec_rag_scores(query: str, doc_ids: list[str]) -> dict[str, dict]:
+    """사전규격 전용 지식DB에서 RAG 점수 조회."""
+    return await _retrieve_rag_scores_for_dataset(DIFY_PRE_SPEC_DATASET_ID, query, doc_ids)
+
+
+async def _update_metadata_for_dataset(dataset_id: str, doc_id: str, fields: dict, field_ids: dict) -> None:
+    """(내부) 특정 dataset의 문서 메타데이터 업데이트."""
+    if not dataset_id:
+        return
+
     headers = {"Authorization": f"Bearer {DIFY_API_KEY}"}
 
     metadata_list = [
-        {"id": FIELD_IDS[key], "name": key, "value": value}
+        {"id": field_ids[key], "name": key, "value": value}
         for key, value in fields.items()
-        if key in FIELD_IDS and FIELD_IDS[key]
+        if key in field_ids and field_ids[key]
     ]
 
     if not metadata_list:
@@ -182,21 +244,18 @@ async def update_metadata(doc_id: str, fields: dict) -> None:
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
-            f"{DIFY_API_URL}/datasets/{DIFY_DATASET_ID}/documents/metadata",
+            f"{DIFY_API_URL}/datasets/{dataset_id}/documents/metadata",
             headers=headers,
             json=payload,
         )
         response.raise_for_status()
 
-    logger.info(f"Dify 메타데이터 업데이트 완료: doc_id={doc_id}")
+    logger.info(f"Dify 메타데이터 업데이트 완료: dataset={dataset_id} doc_id={doc_id}")
 
 
-async def retrieve_rag_scores(query: str, doc_ids: list[str]) -> dict[str, dict]:
-    """
-    Dify 지식DB에서 query로 시맨틱 검색 후 doc_ids 중 매칭된 문서의 점수와 세그먼트 반환.
-    Returns: {doc_id: {"score": float, "segment": str}}  — 문서당 최고 점수 세그먼트
-    """
-    if not doc_ids or not query.strip():
+async def _retrieve_rag_scores_for_dataset(dataset_id: str, query: str, doc_ids: list[str]) -> dict[str, dict]:
+    """(내부) 특정 dataset에서 RAG 점수 조회."""
+    if not dataset_id or not doc_ids or not query.strip():
         return {}
 
     headers = {
@@ -216,7 +275,7 @@ async def retrieve_rag_scores(query: str, doc_ids: list[str]) -> dict[str, dict]
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
-            f"{DIFY_API_URL}/datasets/{DIFY_DATASET_ID}/retrieve",
+            f"{DIFY_API_URL}/datasets/{dataset_id}/retrieve",
             headers=headers,
             json=payload,
         )
@@ -242,3 +301,13 @@ async def retrieve_rag_scores(query: str, doc_ids: list[str]) -> dict[str, dict]
 
     logger.info(f"RAG 검색 완료: {len(results)}/{len(doc_ids)}건 매칭")
     return results
+
+
+async def update_metadata(doc_id: str, fields: dict) -> None:
+    """입찰공고 지식DB 문서 메타데이터 업데이트."""
+    await _update_metadata_for_dataset(DIFY_DATASET_ID, doc_id, fields, FIELD_IDS)
+
+
+async def retrieve_rag_scores(query: str, doc_ids: list[str]) -> dict[str, dict]:
+    """입찰공고 지식DB에서 RAG 점수 조회."""
+    return await _retrieve_rag_scores_for_dataset(DIFY_DATASET_ID, query, doc_ids)

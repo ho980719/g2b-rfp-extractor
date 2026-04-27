@@ -5,10 +5,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from database import get_db
-from locks import matching_lock
-from models import BidCompanyMapping, Bid
+from locks import matching_lock, pre_spec_matching_lock
+from models import BidCompanyMapping, Bid, PreSpecCompanyMapping, PreSpec
 from sqlalchemy.orm.attributes import flag_modified
-from services.matcher import match_company, _get_items, _get_keywords, _calc_keyword_score, _matched_item_codes
+from services.matcher import match_company, match_company_pre_spec, _get_items, _get_keywords, _calc_keyword_score, _matched_item_codes
 from services.dify_client import run_reason_workflow
 
 logger = logging.getLogger(__name__)
@@ -164,4 +164,105 @@ async def generate_reasons(limit: int = 20, db: Session = Depends(get_db)):
 
     db.commit()
     logger.info(f"추천이유 생성: {done}건 완료, {failed}건 실패")
+    return {"processed": len(rows), "done": done, "failed": failed}
+
+
+# ──────────────────────────────────────────
+# 사전규격 매칭
+# ──────────────────────────────────────────
+
+@router.post("/run-pre-specs")
+async def run_pre_spec_matching(db: Session = Depends(get_db)):
+    """
+    활성 기업 전체 대상 사전규격 매칭 배치 실행.
+    BID_NOTICE_MATCH_YN = 'Y' 인 기업만 대상 (공고 매칭과 동일 설정 재사용).
+    """
+    if pre_spec_matching_lock.locked():
+        logger.info("matching/run-pre-specs 이미 실행 중, 스킵")
+        return {"skipped": True, "reason": "already running"}
+
+    async with pre_spec_matching_lock:
+        rows = db.execute(text("""
+            SELECT ci.COMPANY_ID
+            FROM tb_company_info ci
+            JOIN tb_company_custom_setting cs ON ci.COMPANY_ID = cs.COMPANY_ID
+            WHERE ci.USE_YN = 'Y'
+              AND ci.COMPANY_STATUS_CD = 'ACTIVE'
+              AND cs.BID_NOTICE_MATCH_YN = 'Y'
+              AND cs.USE_YN = 'Y'
+        """)).fetchall()
+
+        company_ids = [r[0] for r in rows]
+        logger.info(f"사전규격 배치 매칭 대상 기업: {len(company_ids)}개")
+
+        results = []
+        for company_id in company_ids:
+            result = await match_company_pre_spec(company_id, db, new_only=True)
+            results.append(result)
+
+        total_matched = sum(r.get("matched", 0) for r in results)
+        return {
+            "total_companies": len(company_ids),
+            "total_matched": total_matched,
+            "results": results,
+        }
+
+
+@router.post("/run-pre-specs/{company_id}")
+async def run_pre_spec_matching_company(company_id: int, db: Session = Depends(get_db)):
+    """특정 기업 ID 기준 사전규격 매칭 즉시 실행."""
+    return await match_company_pre_spec(company_id, db)
+
+
+@router.post("/generate-pre-spec-reasons")
+async def generate_pre_spec_reasons(limit: int = 20, db: Session = Depends(get_db)):
+    """
+    tb_pre_specs_company_mapping 중 reason_status='PENDING' 대상으로
+    Dify 워크플로우 호출해 추천 이유 생성.
+    """
+    rows = (
+        db.query(PreSpecCompanyMapping, PreSpec)
+        .join(PreSpec, PreSpecCompanyMapping.bf_spec_rgst_no == PreSpec.bf_spec_rgst_no)
+        .filter(PreSpecCompanyMapping.reason_status == "PENDING")
+        .limit(limit)
+        .all()
+    )
+
+    if not rows:
+        return {"processed": 0, "done": 0, "failed": 0}
+
+    done, failed = 0, 0
+
+    for mapping, ps in rows:
+        kw_json          = mapping.match_keywords or {}
+        matched_items    = kw_json.get("item_names", [])
+        item_name_set    = set(matched_items)
+        matched_keywords = [k for k in kw_json.get("keywords", []) if k not in item_name_set]
+        rag_segment      = kw_json.get("rag", {}).get("segment", "")
+
+        try:
+            reason = await run_reason_workflow(
+                bid_title        = ps.prdct_clsfc_no_nm or "",
+                bid_agency       = ps.order_instt_nm or "",
+                bid_amount       = f"{int(ps.asign_bdgt_amt):,}원" if ps.asign_bdgt_amt else "미정",
+                service_type     = ps.bsns_div_nm or "",
+                matched_items    = matched_items,
+                matched_keywords = matched_keywords,
+                rag_segment      = rag_segment,
+                match_score      = float(mapping.match_score or 0),
+            )
+            if reason:
+                mapping.match_reason = reason[:1000]
+                mapping.reason_status = "DONE"
+                done += 1
+            else:
+                mapping.reason_status = "FAILED"
+                failed += 1
+        except Exception as e:
+            logger.warning(f"사전규격 추천이유 생성 실패 company={mapping.company_id} spec={mapping.bf_spec_rgst_no}: {e}")
+            mapping.reason_status = "FAILED"
+            failed += 1
+
+    db.commit()
+    logger.info(f"사전규격 추천이유 생성: {done}건 완료, {failed}건 실패")
     return {"processed": len(rows), "done": done, "failed": failed}

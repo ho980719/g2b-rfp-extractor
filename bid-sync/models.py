@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, Text, Boolean, BigInteger, JSON, Index, Numeric
+from sqlalchemy import Column, String, DateTime, Text, Boolean, BigInteger, JSON, Index, Numeric, Integer
 from sqlalchemy.sql import func
 from database import Base
 
@@ -61,6 +61,97 @@ class Bid(Base):
         Index("idx_bids_keyword_status",   "keyword_status"),
         Index("idx_bids_ntce_instt",       "ntce_instt_nm"),
         Index("idx_bids_clsfctn_no",       "bid_clsfctn_no"),
+    )
+
+
+class PreSpec(Base):
+    __tablename__ = "tb_pre_specs"
+
+    # 기본 식별자
+    bf_spec_rgst_no      = Column(String(20),   primary_key=True, comment="사전규격등록번호")
+
+    # 공고 기본 정보
+    bsns_div_nm          = Column(String(20),   nullable=True,  comment="업무구분명 (물품/용역/공사/외자)")
+    ref_no               = Column(String(105),  nullable=True,  comment="참조번호")
+    prdct_clsfc_no_nm    = Column(String(200),  nullable=True,  comment="품목/용역분류명 (공고명 역할)")
+    order_instt_nm       = Column(String(200),  nullable=True,  comment="발주기관명")
+    rl_dminstt_nm        = Column(String(200),  nullable=True,  comment="실수요기관명")
+    asign_bdgt_amt       = Column(BigInteger,   nullable=True,  comment="배정예산금액(원)")
+    rcpt_dt              = Column(DateTime,     nullable=True,  comment="접수일시")
+    opnin_rgst_clse_dt   = Column(DateTime,     nullable=True,  comment="의견등록마감일시 (입찰마감 역할)")
+    ofcl_tel_no          = Column(String(25),   nullable=True,  comment="담당자전화번호")
+    ofcl_nm              = Column(String(35),   nullable=True,  comment="담당자명")
+    sw_biz_obj_yn        = Column(String(1),    default="N",    comment="SW사업여부 (Y/N)")
+    dlvr_tmlmt_dt        = Column(DateTime,     nullable=True,  comment="납품기한일시")
+    dlvr_daynum          = Column(Integer,      nullable=True,  comment="납품일수")
+
+    # 파일 (규격문서 최대 5개)
+    spec_doc_file_urls   = Column(JSON,         nullable=True,  comment="규격문서파일 URL 목록 (최대 5개)")
+    has_spec_doc         = Column(Boolean,      default=False,  comment="규격서 보유 여부")
+    prdct_dtl_list       = Column(String(4000), nullable=True,  comment="품목상세목록 원본 ([번호^코드^품목명],...)")
+
+    # 연관 정보
+    bid_ntce_no_list     = Column(String(1000), nullable=True,  comment="연관 입찰공고번호 목록 (콤마 구분)")
+    rgst_dt              = Column(DateTime,     nullable=True,  comment="등록일시")
+    chg_dt               = Column(DateTime,     nullable=True,  comment="변경일시")
+
+    # 파일 처리
+    file_status          = Column(
+        String(20), default="PENDING", nullable=True,
+        comment="파일처리상태 PENDING/PROCESSING/DONE/FAILED/SKIPPED"
+    )
+    file_processed_at    = Column(DateTime,     nullable=True,  comment="파일처리완료일시")
+    file_error_msg       = Column(String(500),  nullable=True,  comment="파일처리실패사유")
+
+    # AI 추천 관련
+    keywords             = Column(JSON,         nullable=True,  comment="추출 키워드 배열")
+    keyword_status       = Column(
+        String(20), default="PENDING", nullable=True,
+        comment="키워드추출상태 PENDING/DONE/FAILED"
+    )
+    keyword_extracted_at = Column(DateTime,     nullable=True,  comment="키워드추출완료일시")
+    dify_doc_id          = Column(String(100),  nullable=True,  comment="Dify 지식DB 문서ID")
+
+    # AI 요약 (UI: AI 요약 버튼)
+    ai_summary           = Column(Text,         nullable=True,  comment="AI 요약문")
+
+    # 메타
+    raw_json             = Column(Text,         nullable=True,  comment="원본 JSON")
+    created_at           = Column(DateTime, server_default=func.now(), comment="생성일시")
+    updated_at           = Column(DateTime, server_default=func.now(), onupdate=func.now(), comment="수정일시")
+
+    __table_args__ = (
+        Index("idx_pre_specs_rcpt_dt",        "rcpt_dt"),
+        Index("idx_pre_specs_opnin_clse_dt",  "opnin_rgst_clse_dt"),
+        Index("idx_pre_specs_file_status",    "file_status"),
+        Index("idx_pre_specs_keyword_status", "keyword_status"),
+        Index("idx_pre_specs_order_instt",    "order_instt_nm"),
+        Index("idx_pre_specs_bsns_div_nm",    "bsns_div_nm"),
+        Index("idx_pre_specs_sw_biz_obj_yn",  "sw_biz_obj_yn"),
+    )
+
+
+class PreSpecCompanyMapping(Base):
+    __tablename__ = "tb_pre_specs_company_mapping"
+
+    company_id       = Column(BigInteger,    primary_key=True, comment="기업ID")
+    bf_spec_rgst_no  = Column(String(40),    primary_key=True, comment="사전규격등록번호")
+
+    match_type_cd    = Column(String(20),    default="AI",      comment="매칭유형 (AI/MANUAL)")
+    match_score      = Column(Numeric(5, 4), nullable=True,      comment="매칭점수 (0.0000~1.0000)")
+    match_reason     = Column(String(1000),  nullable=True,      comment="매칭사유")
+    match_keywords   = Column(JSON,          nullable=True,      comment="매칭 키워드 (items/item_names/keywords/rag)")
+    reason_status    = Column(String(20),    default="PENDING",  comment="추천이유 생성상태 PENDING/DONE/FAILED")
+    bookmark_yn      = Column(String(1),     default="N",        comment="북마크 여부")
+    last_match_dt    = Column(DateTime,      nullable=True,      comment="마지막 매칭일시")
+    created_at       = Column(DateTime,      server_default=func.now())
+    updated_at       = Column(DateTime,      onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_pre_specs_mapping_01", "company_id", "bookmark_yn"),
+        Index("idx_pre_specs_mapping_02", "bf_spec_rgst_no"),
+        Index("idx_pre_specs_mapping_03", "match_type_cd", "last_match_dt"),
+        Index("idx_pre_specs_mapping_04", "reason_status"),
     )
 
 
