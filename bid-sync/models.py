@@ -139,7 +139,8 @@ class PreSpecCompanyMapping(Base):
 
     match_type_cd    = Column(String(20),    default="AI",      comment="매칭유형 (AI/MANUAL)")
     match_score      = Column(Numeric(5, 4), nullable=True,      comment="매칭점수 (0.0000~1.0000)")
-    match_reason     = Column(String(1000),  nullable=True,      comment="매칭사유")
+    match_detail     = Column(String(1000),  nullable=True,      comment="매칭 상세 (품목코드/키워드/RAG 등 가시적 확인용)")
+    match_reason     = Column(String(1000),  nullable=True,      comment="AI 추천이유 (LLM 생성)")
     match_keywords   = Column(JSON,          nullable=True,      comment="매칭 키워드 (items/item_names/keywords/rag)")
     reason_status    = Column(String(20),    default="PENDING",  comment="추천이유 생성상태 PENDING/DONE/FAILED")
     bookmark_yn      = Column(String(1),     default="N",        comment="북마크 여부")
@@ -164,7 +165,8 @@ class BidCompanyMapping(Base):
 
     match_type_cd  = Column(String(20),    default="AI",     comment="매칭유형 (AI/MANUAL)")
     match_score    = Column(Numeric(5, 4), nullable=True,     comment="매칭점수 (0.0000~1.0000)")
-    match_reason   = Column(String(1000),  nullable=True,     comment="매칭사유")
+    match_detail   = Column(String(1000),  nullable=True,     comment="매칭 상세 (품목코드/키워드/RAG 등 가시적 확인용)")
+    match_reason   = Column(String(1000),  nullable=True,     comment="AI 추천이유 (LLM 생성)")
     match_keywords = Column(JSON,          nullable=True,     comment="매칭 키워드 배열")
     reason_status  = Column(String(20),    default="PENDING", comment="추천이유 생성상태 PENDING/DONE/FAILED")
     bookmark_yn    = Column(String(1),     default="N",      comment="북마크 여부")

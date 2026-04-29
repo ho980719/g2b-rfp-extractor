@@ -1,8 +1,11 @@
+import asyncio
 import logging
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+
+from database import SessionLocal
 
 from database import get_db
 from locks import matching_lock, pre_spec_matching_lock
@@ -54,11 +57,21 @@ async def run_batch_matching(db: Session = Depends(get_db)):
         }
 
 
+async def _run_match_bg(company_id: int):
+    db = SessionLocal()
+    try:
+        await match_company(company_id, db)
+    except Exception as e:
+        logger.error(f"백그라운드 공고 매칭 실패 company={company_id}: {e}")
+    finally:
+        db.close()
+
+
 @router.post("/run/{company_id}")
-async def run_company_matching(company_id: int, db: Session = Depends(get_db)):
-    """특정 기업 ID 기준 공고 매칭 즉시 실행."""
-    result = await match_company(company_id, db)
-    return result
+async def run_company_matching(company_id: int, background_tasks: BackgroundTasks):
+    """특정 기업 ID 기준 공고 매칭 백그라운드 실행."""
+    background_tasks.add_task(asyncio.ensure_future, _run_match_bg(company_id))
+    return {"company_id": company_id, "status": "started"}
 
 
 @router.post("/refresh-keywords")
@@ -208,10 +221,21 @@ async def run_pre_spec_matching(db: Session = Depends(get_db)):
         }
 
 
+async def _run_pre_spec_match_bg(company_id: int):
+    db = SessionLocal()
+    try:
+        await match_company_pre_spec(company_id, db)
+    except Exception as e:
+        logger.error(f"백그라운드 사전규격 매칭 실패 company={company_id}: {e}")
+    finally:
+        db.close()
+
+
 @router.post("/run-pre-specs/{company_id}")
-async def run_pre_spec_matching_company(company_id: int, db: Session = Depends(get_db)):
-    """특정 기업 ID 기준 사전규격 매칭 즉시 실행."""
-    return await match_company_pre_spec(company_id, db)
+async def run_pre_spec_matching_company(company_id: int, background_tasks: BackgroundTasks):
+    """특정 기업 ID 기준 사전규격 매칭 백그라운드 실행."""
+    background_tasks.add_task(asyncio.ensure_future, _run_pre_spec_match_bg(company_id))
+    return {"company_id": company_id, "status": "started"}
 
 
 @router.post("/generate-pre-spec-reasons")

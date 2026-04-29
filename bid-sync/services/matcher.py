@@ -65,17 +65,28 @@ def _get_keywords(company_id: int, db: Session) -> tuple[dict[str, str], list[st
 
 
 def _get_settings(company_id: int, db: Session) -> dict:
+    import json
     row = db.execute(text("""
-        SELECT BUDGET_MIN_AMT, BUDGET_MAX_AMT, PARTICIPATION_TYPE_CD
+        SELECT BUDGET_BUCKET_JSON, PARTICIPATION_TYPE_CD
         FROM tb_company_custom_setting
         WHERE COMPANY_ID = :cid AND USE_YN = 'Y'
     """), {"cid": company_id}).fetchone()
     if not row:
         return {}
+
+    budget_buckets: list[dict] = []
+    if row[0]:
+        try:
+            for b in json.loads(row[0]):
+                min_amt = int(b["BUDGET_MIN_AMT"]) if b.get("BUDGET_MIN_AMT") else None
+                max_amt = int(b["BUDGET_MAX_AMT"]) if b.get("BUDGET_MAX_AMT") else None
+                budget_buckets.append({"min": min_amt, "max": max_amt})
+        except Exception:
+            pass
+
     return {
-        "budget_min": row[0],
-        "budget_max": row[1],
-        "participation_type_cd": row[2],
+        "budget_buckets": budget_buckets,
+        "participation_type_cd": row[1],
     }
 
 
@@ -226,10 +237,19 @@ def _get_active_bids(db: Session, settings: dict, company_id: int | None = None,
             )
         ).filter(matched_sub.c.bid_ntce_no == None)
 
-    if settings.get("budget_min"):
-        query = query.filter(Bid.presmpt_prce >= int(settings["budget_min"]))
-    if settings.get("budget_max"):
-        query = query.filter(Bid.presmpt_prce <= int(settings["budget_max"]))
+    buckets = settings.get("budget_buckets") or []
+    if buckets:
+        bucket_conditions = []
+        for b in buckets:
+            conds = []
+            if b["min"] is not None:
+                conds.append(Bid.presmpt_prce >= b["min"])
+            if b["max"] is not None:
+                conds.append(Bid.presmpt_prce < b["max"])
+            if conds:
+                bucket_conditions.append(and_(*conds))
+        if bucket_conditions:
+            query = query.filter(or_(*bucket_conditions))
     # TODO: participation_type_cd 필터 (cntrct_cnclsn_mtd_nm 매핑 기준 확정 후 추가)
     return query.all()
 
@@ -357,7 +377,8 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
 
         if existing:
             existing.match_score = score
-            existing.match_reason = reason[:1000]
+            existing.match_detail = reason[:1000]
+            existing.match_reason = None
             existing.match_keywords = kw_json
             existing.reason_status = "PENDING"
             existing.last_match_dt = now_kst
@@ -369,7 +390,7 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
                 bid_ntce_ord=bid.bid_ntce_ord,
                 match_type_cd="AI",
                 match_score=score,
-                match_reason=reason[:1000],
+                match_detail=reason[:1000],
                 match_keywords=kw_json,
                 reason_status="PENDING",
                 last_match_dt=now_kst,
@@ -428,10 +449,19 @@ def _get_active_pre_specs(db: Session, settings: dict, company_id: int | None = 
             PreSpec.bf_spec_rgst_no == matched_sub.c.bf_spec_rgst_no,
         ).filter(matched_sub.c.bf_spec_rgst_no == None)
 
-    if settings.get("budget_min"):
-        query = query.filter(PreSpec.asign_bdgt_amt >= int(settings["budget_min"]))
-    if settings.get("budget_max"):
-        query = query.filter(PreSpec.asign_bdgt_amt <= int(settings["budget_max"]))
+    buckets = settings.get("budget_buckets") or []
+    if buckets:
+        bucket_conditions = []
+        for b in buckets:
+            conds = []
+            if b["min"] is not None:
+                conds.append(PreSpec.asign_bdgt_amt >= b["min"])
+            if b["max"] is not None:
+                conds.append(PreSpec.asign_bdgt_amt < b["max"])
+            if conds:
+                bucket_conditions.append(and_(*conds))
+        if bucket_conditions:
+            query = query.filter(or_(*bucket_conditions))
 
     return query.all()
 
@@ -562,7 +592,8 @@ async def match_company_pre_spec(company_id: int, db: Session, new_only: bool = 
 
         if existing:
             existing.match_score = score
-            existing.match_reason = reason[:1000]
+            existing.match_detail = reason[:1000]
+            existing.match_reason = None
             existing.match_keywords = kw_json
             existing.reason_status = "PENDING"
             existing.last_match_dt = now_kst
@@ -573,7 +604,7 @@ async def match_company_pre_spec(company_id: int, db: Session, new_only: bool = 
                 bf_spec_rgst_no=ps.bf_spec_rgst_no,
                 match_type_cd="AI",
                 match_score=score,
-                match_reason=reason[:1000],
+                match_detail=reason[:1000],
                 match_keywords=kw_json,
                 reason_status="PENDING",
                 last_match_dt=now_kst,
