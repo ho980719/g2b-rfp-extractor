@@ -155,23 +155,25 @@ def _calc_keyword_score(
     """
     매칭된 원본 키워드명 목록과 점수 반환.
     company_keywords: {normalized: original_nm} — alias 포함
-    bid_ntce_nm: LLM 키워드가 부실할 때 공고명 직접 매칭 보조 사용
+    bid_ntce_nm: LLM 키워드가 부실할 때 공고명 토큰 단위 fallback으로 사용
     """
     if not company_keywords:
         return [], 0.0
 
     # LLM 추출 키워드 정규화
     normalized_bid = [_normalize(k) for k in bid_keywords]
-    # 공고명도 정규화해서 fallback 소스로 추가
-    normalized_title = _normalize(bid_ntce_nm) if bid_ntce_nm else ""
+    # 공고명을 공백 기준 토큰으로 분리해 각각 정규화 (양방향 비교용)
+    title_tokens = [_normalize(t) for t in bid_ntce_nm.split() if t.strip()] if bid_ntce_nm else []
 
     matched_originals: set[str] = set()
     for norm_ck, original_nm in company_keywords.items():
-        # 1순위: LLM 추출 키워드와 매칭
+        # 1순위: LLM 추출 키워드와 양방향 부분 일치
         if normalized_bid and any(norm_ck in bk or bk in norm_ck for bk in normalized_bid):
             matched_originals.add(original_nm)
-        # 2순위: 공고명에 직접 포함 여부 (LLM 추출 실패 보완)
-        elif normalized_title and norm_ck in normalized_title:
+        # 2순위: 공고명 토큰별 양방향 비교 (기존: 전체 문자열 단방향)
+        #   - norm_ck in token: "교통" in "교통체계" → 토큰 안에 키워드 포함
+        #   - token in norm_ck: "교통" in "지능교통시스템" → 키워드 안에 토큰 포함
+        elif title_tokens and any(norm_ck in t or t in norm_ck for t in title_tokens if len(t) >= 2):
             matched_originals.add(original_nm)
 
     if not matched_originals:
@@ -195,14 +197,14 @@ def _calc_profile_keyword_score(
         return [], 0.0
 
     normalized_bid = [_normalize(k) for k in bid_keywords]
-    normalized_title = _normalize(bid_title) if bid_title else ""
+    title_tokens = [_normalize(t) for t in bid_title.split() if t.strip()] if bid_title else []
 
     matched: set[str] = set()
     for pk in profile_keywords:
         norm_pk = _normalize(pk)
         if normalized_bid and any(norm_pk in bk or bk in norm_pk for bk in normalized_bid):
             matched.add(pk)
-        elif normalized_title and norm_pk in normalized_title:
+        elif title_tokens and any(norm_pk in t or t in norm_pk for t in title_tokens if len(t) >= 2):
             matched.add(pk)
 
     if not matched:
