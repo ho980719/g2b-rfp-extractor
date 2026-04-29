@@ -5,9 +5,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
-from database import SessionLocal
-
-from database import get_db
+from database import SessionLocal, get_db
 from locks import matching_lock, pre_spec_matching_lock
 from models import BidCompanyMapping, Bid, PreSpecCompanyMapping, PreSpec
 from sqlalchemy.orm.attributes import flag_modified
@@ -57,21 +55,11 @@ async def run_batch_matching(db: Session = Depends(get_db)):
         }
 
 
-async def _run_match_bg(company_id: int):
-    db = SessionLocal()
-    try:
-        await match_company(company_id, db)
-    except Exception as e:
-        logger.error(f"백그라운드 공고 매칭 실패 company={company_id}: {e}")
-    finally:
-        db.close()
-
-
 @router.post("/run/{company_id}")
-async def run_company_matching(company_id: int, background_tasks: BackgroundTasks):
-    """특정 기업 ID 기준 공고 매칭 백그라운드 실행."""
-    background_tasks.add_task(asyncio.ensure_future, _run_match_bg(company_id))
-    return {"company_id": company_id, "status": "started"}
+async def run_company_matching(company_id: int, db: Session = Depends(get_db)):
+    """특정 기업 ID 기준 공고 매칭 즉시 실행."""
+    result = await match_company(company_id, db)
+    return result
 
 
 @router.post("/refresh-keywords")
@@ -148,7 +136,6 @@ async def generate_reasons(limit: int = 20, db: Session = Depends(get_db)):
         kw_json       = mapping.match_keywords or {}
         matched_items = kw_json.get("item_names", [])
         item_name_set = set(matched_items)
-        # keywords 배열에서 item_names 제외 → 순수 키워드 매칭만 추출
         matched_keywords = [k for k in kw_json.get("keywords", []) if k not in item_name_set]
         rag_segment      = kw_json.get("rag", {}).get("segment", "")
 
@@ -178,6 +165,67 @@ async def generate_reasons(limit: int = 20, db: Session = Depends(get_db)):
     db.commit()
     logger.info(f"추천이유 생성: {done}건 완료, {failed}건 실패")
     return {"processed": len(rows), "done": done, "failed": failed}
+
+
+async def _generate_reasons_bg(company_id: int):
+    """company_id 기준 PENDING 매핑 전체 추천이유 생성 (백그라운드)"""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(BidCompanyMapping, Bid)
+            .join(Bid, (BidCompanyMapping.bid_ntce_no == Bid.bid_ntce_no) &
+                       (BidCompanyMapping.bid_ntce_ord == Bid.bid_ntce_ord))
+            .filter(
+                BidCompanyMapping.company_id == company_id,
+                BidCompanyMapping.reason_status == "PENDING",
+            )
+            .all()
+        )
+
+        done, failed = 0, 0
+        for mapping, bid in rows:
+            kw_json       = mapping.match_keywords or {}
+            matched_items = kw_json.get("item_names", [])
+            item_name_set = set(matched_items)
+            matched_keywords = [k for k in kw_json.get("keywords", []) if k not in item_name_set]
+            rag_segment      = kw_json.get("rag", {}).get("segment", "")
+
+            try:
+                reason = await run_reason_workflow(
+                    bid_title        = bid.bid_ntce_nm or "",
+                    bid_agency       = bid.ntce_instt_nm or "",
+                    bid_amount       = f"{int(bid.presmpt_prce):,}원" if bid.presmpt_prce else "미정",
+                    service_type     = bid.srvce_div_nm or "",
+                    matched_items    = matched_items,
+                    matched_keywords = matched_keywords,
+                    rag_segment      = rag_segment,
+                    match_score      = float(mapping.match_score or 0),
+                )
+                if reason:
+                    mapping.match_reason = reason[:1000]
+                    mapping.reason_status = "DONE"
+                    done += 1
+                else:
+                    mapping.reason_status = "FAILED"
+                    failed += 1
+            except Exception as e:
+                logger.warning(f"추천이유 생성 실패 company={company_id} bid={mapping.bid_ntce_no}: {e}")
+                mapping.reason_status = "FAILED"
+                failed += 1
+
+        db.commit()
+        logger.info(f"공고 추천이유 생성 완료 company={company_id}: {done}건 완료, {failed}건 실패")
+    except Exception as e:
+        logger.error(f"공고 추천이유 생성 오류 company={company_id}: {e}")
+    finally:
+        db.close()
+
+
+@router.post("/generate-reasons/{company_id}")
+async def generate_reasons_by_company(company_id: int, background_tasks: BackgroundTasks):
+    """특정 기업 ID 기준 공고 추천이유 생성 백그라운드 실행."""
+    background_tasks.add_task(_generate_reasons_bg, company_id)
+    return {"company_id": company_id, "status": "started"}
 
 
 # ──────────────────────────────────────────
@@ -221,21 +269,10 @@ async def run_pre_spec_matching(db: Session = Depends(get_db)):
         }
 
 
-async def _run_pre_spec_match_bg(company_id: int):
-    db = SessionLocal()
-    try:
-        await match_company_pre_spec(company_id, db)
-    except Exception as e:
-        logger.error(f"백그라운드 사전규격 매칭 실패 company={company_id}: {e}")
-    finally:
-        db.close()
-
-
 @router.post("/run-pre-specs/{company_id}")
-async def run_pre_spec_matching_company(company_id: int, background_tasks: BackgroundTasks):
-    """특정 기업 ID 기준 사전규격 매칭 백그라운드 실행."""
-    background_tasks.add_task(asyncio.ensure_future, _run_pre_spec_match_bg(company_id))
-    return {"company_id": company_id, "status": "started"}
+async def run_pre_spec_matching_company(company_id: int, db: Session = Depends(get_db)):
+    """특정 기업 ID 기준 사전규격 매칭 즉시 실행."""
+    return await match_company_pre_spec(company_id, db)
 
 
 @router.post("/generate-pre-spec-reasons")
@@ -290,3 +327,63 @@ async def generate_pre_spec_reasons(limit: int = 20, db: Session = Depends(get_d
     db.commit()
     logger.info(f"사전규격 추천이유 생성: {done}건 완료, {failed}건 실패")
     return {"processed": len(rows), "done": done, "failed": failed}
+
+
+async def _generate_pre_spec_reasons_bg(company_id: int):
+    """company_id 기준 PENDING 사전규격 매핑 전체 추천이유 생성 (백그라운드)"""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(PreSpecCompanyMapping, PreSpec)
+            .join(PreSpec, PreSpecCompanyMapping.bf_spec_rgst_no == PreSpec.bf_spec_rgst_no)
+            .filter(
+                PreSpecCompanyMapping.company_id == company_id,
+                PreSpecCompanyMapping.reason_status == "PENDING",
+            )
+            .all()
+        )
+
+        done, failed = 0, 0
+        for mapping, ps in rows:
+            kw_json          = mapping.match_keywords or {}
+            matched_items    = kw_json.get("item_names", [])
+            item_name_set    = set(matched_items)
+            matched_keywords = [k for k in kw_json.get("keywords", []) if k not in item_name_set]
+            rag_segment      = kw_json.get("rag", {}).get("segment", "")
+
+            try:
+                reason = await run_reason_workflow(
+                    bid_title        = ps.prdct_clsfc_no_nm or "",
+                    bid_agency       = ps.order_instt_nm or "",
+                    bid_amount       = f"{int(ps.asign_bdgt_amt):,}원" if ps.asign_bdgt_amt else "미정",
+                    service_type     = ps.bsns_div_nm or "",
+                    matched_items    = matched_items,
+                    matched_keywords = matched_keywords,
+                    rag_segment      = rag_segment,
+                    match_score      = float(mapping.match_score or 0),
+                )
+                if reason:
+                    mapping.match_reason = reason[:1000]
+                    mapping.reason_status = "DONE"
+                    done += 1
+                else:
+                    mapping.reason_status = "FAILED"
+                    failed += 1
+            except Exception as e:
+                logger.warning(f"사전규격 추천이유 생성 실패 company={company_id} spec={mapping.bf_spec_rgst_no}: {e}")
+                mapping.reason_status = "FAILED"
+                failed += 1
+
+        db.commit()
+        logger.info(f"사전규격 추천이유 생성 완료 company={company_id}: {done}건 완료, {failed}건 실패")
+    except Exception as e:
+        logger.error(f"사전규격 추천이유 생성 오류 company={company_id}: {e}")
+    finally:
+        db.close()
+
+
+@router.post("/generate-pre-spec-reasons/{company_id}")
+async def generate_pre_spec_reasons_by_company(company_id: int, background_tasks: BackgroundTasks):
+    """특정 기업 ID 기준 사전규격 추천이유 생성 백그라운드 실행."""
+    background_tasks.add_task(_generate_pre_spec_reasons_bg, company_id)
+    return {"company_id": company_id, "status": "started"}
