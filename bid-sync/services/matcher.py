@@ -307,7 +307,7 @@ async def match_company(company_id: int, db: Session, new_only: bool = False) ->
     logger.info(f"기업 {company_id}: 1차 필터 후 후보 {len(candidates)}건")
 
     # 2단계: 후보 대상 Dify RAG 점수 조회
-    rag_query = " ".join(keywords_raw[:10] + profile_kws[:5])
+    rag_query = " ".join(keywords_raw[:10] + profile_kws)
     if profile_summary:
         rag_query = f"{profile_summary[:300]} {rag_query}"
 
@@ -528,7 +528,7 @@ async def match_company_pre_spec(company_id: int, db: Session, new_only: bool = 
     logger.info(f"기업 {company_id}: 사전규격 1차 필터 후 후보 {len(candidates)}건")
 
     # 2단계: 후보 대상 Dify RAG 점수 조회
-    rag_query = " ".join(keywords_raw[:10] + profile_kws[:5])
+    rag_query = " ".join(keywords_raw[:10] + profile_kws)
     if profile_summary:
         rag_query = f"{profile_summary[:300]} {rag_query}"
 

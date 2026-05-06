@@ -36,11 +36,10 @@ async def run_batch_matching(db: Session = Depends(get_db)):
         rows = db.execute(text("""
             SELECT ci.COMPANY_ID
             FROM tb_company_info ci
-            JOIN tb_company_custom_setting cs ON ci.COMPANY_ID = cs.COMPANY_ID
+            LEFT JOIN tb_company_custom_setting cs ON ci.COMPANY_ID = cs.COMPANY_ID AND cs.USE_YN = 'Y'
             WHERE ci.USE_YN = 'Y'
               AND ci.COMPANY_STATUS_CD = 'ACTIVE'
-              AND cs.BID_NOTICE_MATCH_YN = 'Y'
-              AND cs.USE_YN = 'Y'
+              AND (cs.BID_NOTICE_MATCH_YN = 'Y' OR cs.COMPANY_ID IS NULL)
         """)).fetchall()
 
         company_ids = [r[0] for r in rows]
@@ -123,6 +122,7 @@ async def refresh_keywords(db: Session = Depends(get_db)):
 async def generate_reasons(limit: int = 20, db: Session = Depends(get_db)):
     """
     reason_status='PENDING' 인 매핑 대상으로 Dify 워크플로우 호출해 추천 이유 생성.
+    match_score 높은 순으로 처리.
     limit: 1회 처리 건수 (스케쥴링 체인에 추가해서 반복 호출 권장)
     """
     rows = (
@@ -130,6 +130,7 @@ async def generate_reasons(limit: int = 20, db: Session = Depends(get_db)):
         .join(Bid, (BidCompanyMapping.bid_ntce_no == Bid.bid_ntce_no) &
                    (BidCompanyMapping.bid_ntce_ord == Bid.bid_ntce_ord))
         .filter(BidCompanyMapping.reason_status == "PENDING")
+        .order_by(BidCompanyMapping.match_score.desc())
         .limit(limit)
         .all()
     )
@@ -190,6 +191,7 @@ async def _generate_reasons_bg(company_id: int):
                     BidCompanyMapping.company_id == company_id,
                     BidCompanyMapping.reason_status == "PENDING",
                 )
+                .order_by(BidCompanyMapping.match_score.desc())
                 .all()
             )
 
@@ -232,9 +234,94 @@ async def _generate_reasons_bg(company_id: int):
             db.close()
 
 
+async def _generate_reasons_top_bg(company_id: int, limit: int):
+    """company_id 기준 match_score 상위 N건 추천이유 생성 (백그라운드, 페이지 진입 시 온디맨드용)"""
+    if company_reason_lock.locked(company_id):
+        logger.info(f"추천이유 생성 이미 실행 중, 스킵 company={company_id}")
+        return
+    async with company_reason_lock.get(company_id):
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(BidCompanyMapping, Bid)
+                .join(Bid, (BidCompanyMapping.bid_ntce_no == Bid.bid_ntce_no) &
+                           (BidCompanyMapping.bid_ntce_ord == Bid.bid_ntce_ord))
+                .filter(
+                    BidCompanyMapping.company_id == company_id,
+                    BidCompanyMapping.reason_status == "PENDING",
+                )
+                .order_by(BidCompanyMapping.match_score.desc())
+                .limit(limit)
+                .all()
+            )
+
+            if not rows:
+                return
+
+            # 즉시 GENERATING으로 마킹 → 배치/재요청에서 중복 처리 방지
+            for mapping, _ in rows:
+                mapping.reason_status = "GENERATING"
+            db.commit()
+
+            done, failed = 0, 0
+            for mapping, bid in rows:
+                kw_json       = mapping.match_keywords or {}
+                matched_items = kw_json.get("item_names", [])
+                item_name_set = set(matched_items)
+                matched_keywords = [k for k in kw_json.get("keywords", []) if k not in item_name_set]
+                rag_segment      = kw_json.get("rag", {}).get("segment", "")
+
+                try:
+                    reason = await run_reason_workflow(
+                        bid_title        = bid.bid_ntce_nm or "",
+                        bid_agency       = bid.ntce_instt_nm or "",
+                        bid_amount       = f"{int(bid.presmpt_prce):,}원" if bid.presmpt_prce else "미정",
+                        service_type     = bid.srvce_div_nm or "",
+                        matched_items    = matched_items,
+                        matched_keywords = matched_keywords,
+                        rag_segment      = rag_segment,
+                        match_score      = float(mapping.match_score or 0),
+                    )
+                    if reason:
+                        mapping.match_reason = reason[:1000]
+                        mapping.reason_status = "DONE"
+                        done += 1
+                    else:
+                        mapping.reason_status = "FAILED"
+                        failed += 1
+                except Exception as e:
+                    logger.warning(f"추천이유 생성 실패 company={company_id} bid={mapping.bid_ntce_no}: {e}")
+                    mapping.reason_status = "FAILED"
+                    failed += 1
+
+            db.commit()
+            logger.info(f"공고 추천이유 상위{limit}건 생성 완료 company={company_id}: {done}건 완료, {failed}건 실패")
+        except Exception as e:
+            logger.error(f"공고 추천이유 상위{limit}건 생성 오류 company={company_id}: {e}")
+        finally:
+            db.close()
+
+
+@router.post("/generate-reasons/{company_id}/top")
+async def generate_reasons_top_by_company(
+    company_id: int,
+    background_tasks: BackgroundTasks,
+    limit: int = 20,
+):
+    """
+    특정 기업 match_score 상위 N건 추천이유 우선 생성 (백그라운드).
+    페이지 진입 시 Spring에서 호출해 skeleton UI를 빠르게 채우는 용도.
+    """
+    if company_reason_lock.locked(company_id):
+        logger.info(f"generate-reasons/{company_id}/top 이미 실행 중, 스킵")
+        return {"company_id": company_id, "status": "skipped", "reason": "already running"}
+    background_tasks.add_task(_generate_reasons_top_bg, company_id, limit)
+    return {"company_id": company_id, "limit": limit, "status": "started"}
+
+
 @router.post("/generate-reasons/{company_id}")
 async def generate_reasons_by_company(company_id: int, background_tasks: BackgroundTasks):
-    """특정 기업 ID 기준 공고 추천이유 생성 백그라운드 실행."""
+    """특정 기업 ID 기준 공고 추천이유 전체 생성 백그라운드 실행 (match_score 높은 순)."""
     if company_reason_lock.locked(company_id):
         logger.info(f"generate-reasons/{company_id} 이미 실행 중, 스킵")
         return {"company_id": company_id, "status": "skipped", "reason": "already running"}
@@ -260,11 +347,10 @@ async def run_pre_spec_matching(db: Session = Depends(get_db)):
         rows = db.execute(text("""
             SELECT ci.COMPANY_ID
             FROM tb_company_info ci
-            JOIN tb_company_custom_setting cs ON ci.COMPANY_ID = cs.COMPANY_ID
+            LEFT JOIN tb_company_custom_setting cs ON ci.COMPANY_ID = cs.COMPANY_ID AND cs.USE_YN = 'Y'
             WHERE ci.USE_YN = 'Y'
               AND ci.COMPANY_STATUS_CD = 'ACTIVE'
-              AND cs.BID_NOTICE_MATCH_YN = 'Y'
-              AND cs.USE_YN = 'Y'
+              AND (cs.BID_NOTICE_MATCH_YN = 'Y' OR cs.COMPANY_ID IS NULL)
         """)).fetchall()
 
         company_ids = [r[0] for r in rows]
@@ -303,6 +389,7 @@ async def generate_pre_spec_reasons(limit: int = 20, db: Session = Depends(get_d
         db.query(PreSpecCompanyMapping, PreSpec)
         .join(PreSpec, PreSpecCompanyMapping.bf_spec_rgst_no == PreSpec.bf_spec_rgst_no)
         .filter(PreSpecCompanyMapping.reason_status == "PENDING")
+        .order_by(PreSpecCompanyMapping.match_score.desc())
         .limit(limit)
         .all()
     )
@@ -362,6 +449,7 @@ async def _generate_pre_spec_reasons_bg(company_id: int):
                     PreSpecCompanyMapping.company_id == company_id,
                     PreSpecCompanyMapping.reason_status == "PENDING",
                 )
+                .order_by(PreSpecCompanyMapping.match_score.desc())
                 .all()
             )
 
@@ -404,9 +492,93 @@ async def _generate_pre_spec_reasons_bg(company_id: int):
             db.close()
 
 
+async def _generate_pre_spec_reasons_top_bg(company_id: int, limit: int):
+    """company_id 기준 match_score 상위 N건 사전규격 추천이유 생성 (백그라운드, 온디맨드용)"""
+    if company_pre_spec_reason_lock.locked(company_id):
+        logger.info(f"사전규격 추천이유 생성 이미 실행 중, 스킵 company={company_id}")
+        return
+    async with company_pre_spec_reason_lock.get(company_id):
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(PreSpecCompanyMapping, PreSpec)
+                .join(PreSpec, PreSpecCompanyMapping.bf_spec_rgst_no == PreSpec.bf_spec_rgst_no)
+                .filter(
+                    PreSpecCompanyMapping.company_id == company_id,
+                    PreSpecCompanyMapping.reason_status == "PENDING",
+                )
+                .order_by(PreSpecCompanyMapping.match_score.desc())
+                .limit(limit)
+                .all()
+            )
+
+            if not rows:
+                return
+
+            # 즉시 GENERATING으로 마킹 → 배치/재요청에서 중복 처리 방지
+            for mapping, _ in rows:
+                mapping.reason_status = "GENERATING"
+            db.commit()
+
+            done, failed = 0, 0
+            for mapping, ps in rows:
+                kw_json          = mapping.match_keywords or {}
+                matched_items    = kw_json.get("item_names", [])
+                item_name_set    = set(matched_items)
+                matched_keywords = [k for k in kw_json.get("keywords", []) if k not in item_name_set]
+                rag_segment      = kw_json.get("rag", {}).get("segment", "")
+
+                try:
+                    reason = await run_reason_workflow(
+                        bid_title        = ps.prdct_clsfc_no_nm or "",
+                        bid_agency       = ps.order_instt_nm or "",
+                        bid_amount       = f"{int(ps.asign_bdgt_amt):,}원" if ps.asign_bdgt_amt else "미정",
+                        service_type     = ps.bsns_div_nm or "",
+                        matched_items    = matched_items,
+                        matched_keywords = matched_keywords,
+                        rag_segment      = rag_segment,
+                        match_score      = float(mapping.match_score or 0),
+                    )
+                    if reason:
+                        mapping.match_reason = reason[:1000]
+                        mapping.reason_status = "DONE"
+                        done += 1
+                    else:
+                        mapping.reason_status = "FAILED"
+                        failed += 1
+                except Exception as e:
+                    logger.warning(f"사전규격 추천이유 생성 실패 company={company_id} spec={mapping.bf_spec_rgst_no}: {e}")
+                    mapping.reason_status = "FAILED"
+                    failed += 1
+
+            db.commit()
+            logger.info(f"사전규격 추천이유 상위{limit}건 생성 완료 company={company_id}: {done}건 완료, {failed}건 실패")
+        except Exception as e:
+            logger.error(f"사전규격 추천이유 상위{limit}건 생성 오류 company={company_id}: {e}")
+        finally:
+            db.close()
+
+
+@router.post("/generate-pre-spec-reasons/{company_id}/top")
+async def generate_pre_spec_reasons_top_by_company(
+    company_id: int,
+    background_tasks: BackgroundTasks,
+    limit: int = 20,
+):
+    """
+    특정 기업 사전규격 match_score 상위 N건 추천이유 우선 생성 (백그라운드).
+    페이지 진입 시 Spring에서 호출해 skeleton UI를 빠르게 채우는 용도.
+    """
+    if company_pre_spec_reason_lock.locked(company_id):
+        logger.info(f"generate-pre-spec-reasons/{company_id}/top 이미 실행 중, 스킵")
+        return {"company_id": company_id, "status": "skipped", "reason": "already running"}
+    background_tasks.add_task(_generate_pre_spec_reasons_top_bg, company_id, limit)
+    return {"company_id": company_id, "limit": limit, "status": "started"}
+
+
 @router.post("/generate-pre-spec-reasons/{company_id}")
 async def generate_pre_spec_reasons_by_company(company_id: int, background_tasks: BackgroundTasks):
-    """특정 기업 ID 기준 사전규격 추천이유 생성 백그라운드 실행."""
+    """특정 기업 ID 기준 사전규격 추천이유 전체 생성 백그라운드 실행 (match_score 높은 순)."""
     if company_pre_spec_reason_lock.locked(company_id):
         logger.info(f"generate-pre-spec-reasons/{company_id} 이미 실행 중, 스킵")
         return {"company_id": company_id, "status": "skipped", "reason": "already running"}
